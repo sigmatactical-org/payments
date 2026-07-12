@@ -1,0 +1,456 @@
+use chrono::{DateTime, Utc};
+use sqlx::{PgPool, Row};
+use thiserror::Error;
+
+use crate::model::{
+    CreatePaymentMethod, PaymentMethod, PaymentMethodType, UpdatePaymentMethod, validate_expiry,
+};
+
+#[derive(Debug, Error)]
+pub enum StoreError {
+    #[error("payment method not found")]
+    NotFound,
+    #[error("{0}")]
+    InvalidInput(String),
+    #[error("database error: {0}")]
+    Database(#[from] anyhow::Error),
+}
+
+impl From<sqlx::Error> for StoreError {
+    fn from(err: sqlx::Error) -> Self {
+        Self::Database(err.into())
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct PaymentMethodStore {
+    pool: PgPool,
+}
+
+impl PaymentMethodStore {
+    pub async fn connect() -> Result<Self, StoreError> {
+        let pool = sigma_pg::connect_as("payments").await?;
+        Ok(Self { pool })
+    }
+
+    #[cfg(test)]
+    pub async fn connect_empty() -> Result<Self, StoreError> {
+        let store = Self::connect().await?;
+        sqlx::query("TRUNCATE payments.payment_methods")
+            .execute(&store.pool)
+            .await?;
+        Ok(store)
+    }
+
+    #[must_use]
+    pub fn pool(&self) -> &PgPool {
+        &self.pool
+    }
+
+    /// List every payment method owned by `user_id`. Every read in this
+    /// service is scoped by the caller's verified session `user_id` — there
+    /// is no "list all payment methods" endpoint.
+    pub async fn list_for_user(&self, user_id: &str) -> Result<Vec<PaymentMethod>, StoreError> {
+        let rows = sqlx::query(
+            "SELECT id, user_id, method_type, billing_address_id, label, brand, last4, \
+             expiry_month, expiry_year, is_default, updated_at \
+             FROM payments.payment_methods WHERE user_id = $1 ORDER BY updated_at DESC",
+        )
+        .bind(user_id)
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter().map(row_to_payment_method).collect()
+    }
+
+    /// Fetch one payment method, scoped to `user_id`. Returns
+    /// [`StoreError::NotFound`] both when the id doesn't exist and when it
+    /// belongs to a different user — the two cases are indistinguishable to
+    /// the caller so a user can't probe for the existence of another user's
+    /// payment method ids.
+    pub async fn get_for_user(&self, user_id: &str, id: &str) -> Result<PaymentMethod, StoreError> {
+        let row = sqlx::query(
+            "SELECT id, user_id, method_type, billing_address_id, label, brand, last4, \
+             expiry_month, expiry_year, is_default, updated_at \
+             FROM payments.payment_methods WHERE id = $1 AND user_id = $2",
+        )
+        .bind(id)
+        .bind(user_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        match row {
+            Some(row) => row_to_payment_method(row),
+            None => Err(StoreError::NotFound),
+        }
+    }
+
+    pub async fn create(
+        &self,
+        user_id: &str,
+        input: CreatePaymentMethod,
+    ) -> Result<PaymentMethod, StoreError> {
+        validate_fields(
+            input.method_type,
+            &input.billing_address_id,
+            &input.last4,
+            input.expiry_month,
+            input.expiry_year,
+        )?;
+        let payment_method = PaymentMethod::new(user_id, input);
+        sqlx::query(
+            "INSERT INTO payments.payment_methods \
+             (id, user_id, method_type, billing_address_id, label, brand, last4, \
+              expiry_month, expiry_year, is_default, updated_at) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)",
+        )
+        .bind(&payment_method.id)
+        .bind(&payment_method.user_id)
+        .bind(payment_method.method_type.as_str())
+        .bind(&payment_method.billing_address_id)
+        .bind(&payment_method.label)
+        .bind(&payment_method.brand)
+        .bind(&payment_method.last4)
+        .bind(payment_method.expiry_month.map(i16::from))
+        .bind(payment_method.expiry_year.map(|y| y as i16))
+        .bind(payment_method.is_default)
+        .bind(parse_ts(&payment_method.updated_at)?)
+        .execute(&self.pool)
+        .await?;
+        Ok(payment_method)
+    }
+
+    pub async fn update(
+        &self,
+        user_id: &str,
+        id: &str,
+        input: UpdatePaymentMethod,
+    ) -> Result<PaymentMethod, StoreError> {
+        let mut payment_method = self.get_for_user(user_id, id).await?;
+        validate_fields(
+            payment_method.method_type,
+            &input.billing_address_id,
+            &input.last4,
+            input.expiry_month,
+            input.expiry_year,
+        )?;
+        payment_method.apply_update(input);
+        sqlx::query(
+            "UPDATE payments.payment_methods SET billing_address_id = $3, label = $4, \
+             brand = $5, last4 = $6, expiry_month = $7, expiry_year = $8, updated_at = $9 \
+             WHERE id = $1 AND user_id = $2",
+        )
+        .bind(&payment_method.id)
+        .bind(user_id)
+        .bind(&payment_method.billing_address_id)
+        .bind(&payment_method.label)
+        .bind(&payment_method.brand)
+        .bind(&payment_method.last4)
+        .bind(payment_method.expiry_month.map(i16::from))
+        .bind(payment_method.expiry_year.map(|y| y as i16))
+        .bind(parse_ts(&payment_method.updated_at)?)
+        .execute(&self.pool)
+        .await?;
+        Ok(payment_method)
+    }
+
+    pub async fn delete(&self, user_id: &str, id: &str) -> Result<(), StoreError> {
+        let result =
+            sqlx::query("DELETE FROM payments.payment_methods WHERE id = $1 AND user_id = $2")
+                .bind(id)
+                .bind(user_id)
+                .execute(&self.pool)
+                .await?;
+        if result.rows_affected() == 0 {
+            return Err(StoreError::NotFound);
+        }
+        Ok(())
+    }
+
+    /// Promote `id` to the default payment method for `user_id`. The DB
+    /// enforces at most one default per user via a partial unique index (no
+    /// category dimension, unlike addresses — there is only one category of
+    /// payment method), so any other default for the same user must be
+    /// cleared in the same transaction before this row is set, or the
+    /// second write would violate the index.
+    pub async fn set_default(&self, user_id: &str, id: &str) -> Result<(), StoreError> {
+        self.get_for_user(user_id, id).await?;
+        let mut tx = self.pool.begin().await?;
+        sqlx::query(
+            "UPDATE payments.payment_methods SET is_default = false \
+             WHERE user_id = $1 AND id != $2",
+        )
+        .bind(user_id)
+        .bind(id)
+        .execute(&mut *tx)
+        .await?;
+        let result = sqlx::query(
+            "UPDATE payments.payment_methods SET is_default = true, updated_at = now() \
+             WHERE id = $1 AND user_id = $2",
+        )
+        .bind(id)
+        .bind(user_id)
+        .execute(&mut *tx)
+        .await?;
+        if result.rows_affected() == 0 {
+            tx.rollback().await?;
+            return Err(StoreError::NotFound);
+        }
+        tx.commit().await?;
+        Ok(())
+    }
+}
+
+fn validate_fields(
+    method_type: PaymentMethodType,
+    billing_address_id: &str,
+    last4: &str,
+    expiry_month: Option<u8>,
+    expiry_year: Option<u16>,
+) -> Result<(), StoreError> {
+    if billing_address_id.trim().is_empty() {
+        return Err(StoreError::InvalidInput(
+            "billing_address_id is required".to_string(),
+        ));
+    }
+    if last4.len() != 4 || !last4.bytes().all(|b| b.is_ascii_digit()) {
+        return Err(StoreError::InvalidInput(
+            "last4 must be exactly 4 digits".to_string(),
+        ));
+    }
+    validate_expiry(method_type, expiry_month, expiry_year).map_err(StoreError::InvalidInput)?;
+    Ok(())
+}
+
+fn row_to_payment_method(row: sqlx::postgres::PgRow) -> Result<PaymentMethod, StoreError> {
+    let method_type_str: String = row.get("method_type");
+    let expiry_month: Option<i16> = row.get("expiry_month");
+    let expiry_year: Option<i16> = row.get("expiry_year");
+    Ok(PaymentMethod {
+        id: row.get("id"),
+        user_id: row.get("user_id"),
+        method_type: PaymentMethodType::parse(&method_type_str)
+            .map_err(StoreError::InvalidInput)?,
+        billing_address_id: row.get("billing_address_id"),
+        label: row.get("label"),
+        brand: row.get("brand"),
+        last4: row.get("last4"),
+        expiry_month: expiry_month.map(|v| v as u8),
+        expiry_year: expiry_year.map(|v| v as u16),
+        is_default: row.get("is_default"),
+        updated_at: row.get::<DateTime<Utc>, _>("updated_at").to_rfc3339(),
+    })
+}
+
+fn parse_ts(value: &str) -> Result<DateTime<Utc>, StoreError> {
+    value
+        .parse::<DateTime<Utc>>()
+        .map_err(|e| StoreError::InvalidInput(format!("invalid timestamp: {e}")))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    async fn test_store() -> PaymentMethodStore {
+        PaymentMethodStore::connect_empty()
+            .await
+            .expect("PostgreSQL required for tests")
+    }
+
+    fn credit_card_input(last4: &str) -> CreatePaymentMethod {
+        CreatePaymentMethod {
+            method_type: PaymentMethodType::CreditCard,
+            billing_address_id: "addr-1".to_string(),
+            label: Some("Personal Visa".to_string()),
+            brand: Some("Visa".to_string()),
+            last4: last4.to_string(),
+            expiry_month: Some(12),
+            expiry_year: Some(2099),
+        }
+    }
+
+    fn bank_account_input(last4: &str) -> CreatePaymentMethod {
+        CreatePaymentMethod {
+            method_type: PaymentMethodType::BankAccount,
+            billing_address_id: "addr-1".to_string(),
+            label: Some("Checking".to_string()),
+            brand: Some("First Sigma Bank".to_string()),
+            last4: last4.to_string(),
+            expiry_month: None,
+            expiry_year: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn create_list_update_delete_round_trip() {
+        let store = test_store().await;
+        let payment_method = store
+            .create("user-1", credit_card_input("4242"))
+            .await
+            .unwrap();
+        assert_eq!(payment_method.user_id, "user-1");
+        assert!(!payment_method.is_default);
+
+        let listed = store.list_for_user("user-1").await.unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].id, payment_method.id);
+
+        let updated = store
+            .update(
+                "user-1",
+                &payment_method.id,
+                UpdatePaymentMethod {
+                    billing_address_id: "addr-2".to_string(),
+                    label: Some("Work Visa".to_string()),
+                    brand: Some("Visa".to_string()),
+                    last4: "1111".to_string(),
+                    expiry_month: Some(1),
+                    expiry_year: Some(2099),
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(updated.billing_address_id, "addr-2");
+        assert_eq!(updated.last4, "1111");
+        assert_eq!(updated.label.as_deref(), Some("Work Visa"));
+
+        store.delete("user-1", &payment_method.id).await.unwrap();
+        let err = store
+            .get_for_user("user-1", &payment_method.id)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, StoreError::NotFound));
+    }
+
+    #[tokio::test]
+    async fn bank_account_round_trip_has_no_expiry() {
+        let store = test_store().await;
+        let payment_method = store
+            .create("user-1", bank_account_input("5678"))
+            .await
+            .unwrap();
+        assert!(payment_method.expiry_month.is_none());
+        assert!(payment_method.expiry_year.is_none());
+
+        let fetched = store
+            .get_for_user("user-1", &payment_method.id)
+            .await
+            .unwrap();
+        assert!(fetched.expiry_month.is_none());
+        assert!(fetched.expiry_year.is_none());
+    }
+
+    #[tokio::test]
+    async fn get_for_user_hides_other_users_payment_methods() {
+        let store = test_store().await;
+        let payment_method = store
+            .create("user-1", credit_card_input("4242"))
+            .await
+            .unwrap();
+        let err = store
+            .get_for_user("user-2", &payment_method.id)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, StoreError::NotFound));
+    }
+
+    #[tokio::test]
+    async fn delete_missing_payment_method_returns_not_found() {
+        let store = test_store().await;
+        let err = store.delete("user-1", "does-not-exist").await.unwrap_err();
+        assert!(matches!(err, StoreError::NotFound));
+    }
+
+    #[tokio::test]
+    async fn create_rejects_bad_last4() {
+        let store = test_store().await;
+        let err = store
+            .create("user-1", credit_card_input("42"))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, StoreError::InvalidInput(_)));
+    }
+
+    #[tokio::test]
+    async fn create_rejects_credit_card_missing_expiry() {
+        let store = test_store().await;
+        let mut input = credit_card_input("4242");
+        input.expiry_month = None;
+        let err = store.create("user-1", input).await.unwrap_err();
+        assert!(matches!(err, StoreError::InvalidInput(_)));
+    }
+
+    #[tokio::test]
+    async fn create_rejects_bank_account_with_expiry() {
+        let store = test_store().await;
+        let mut input = bank_account_input("4242");
+        input.expiry_month = Some(1);
+        let err = store.create("user-1", input).await.unwrap_err();
+        assert!(matches!(err, StoreError::InvalidInput(_)));
+    }
+
+    #[tokio::test]
+    async fn set_default_clears_previous_default() {
+        let store = test_store().await;
+        let a = store
+            .create("user-1", credit_card_input("4242"))
+            .await
+            .unwrap();
+        let b = store
+            .create("user-1", bank_account_input("5678"))
+            .await
+            .unwrap();
+
+        store.set_default("user-1", &a.id).await.unwrap();
+        let listed = store.list_for_user("user-1").await.unwrap();
+        assert!(listed.iter().find(|x| x.id == a.id).unwrap().is_default);
+        assert!(!listed.iter().find(|x| x.id == b.id).unwrap().is_default);
+
+        store.set_default("user-1", &b.id).await.unwrap();
+        let listed = store.list_for_user("user-1").await.unwrap();
+        assert!(!listed.iter().find(|x| x.id == a.id).unwrap().is_default);
+        assert!(listed.iter().find(|x| x.id == b.id).unwrap().is_default);
+    }
+
+    #[tokio::test]
+    async fn set_default_does_not_affect_other_users() {
+        let store = test_store().await;
+        let user1_method = store
+            .create("user-1", credit_card_input("4242"))
+            .await
+            .unwrap();
+        let user2_method = store
+            .create("user-2", bank_account_input("5678"))
+            .await
+            .unwrap();
+
+        store.set_default("user-2", &user2_method.id).await.unwrap();
+        store.set_default("user-1", &user1_method.id).await.unwrap();
+
+        let user1_listed = store.list_for_user("user-1").await.unwrap();
+        let user2_listed = store.list_for_user("user-2").await.unwrap();
+        assert!(
+            user1_listed
+                .iter()
+                .find(|x| x.id == user1_method.id)
+                .unwrap()
+                .is_default
+        );
+        assert!(
+            user2_listed
+                .iter()
+                .find(|x| x.id == user2_method.id)
+                .unwrap()
+                .is_default
+        );
+    }
+
+    #[tokio::test]
+    async fn set_default_missing_payment_method_returns_not_found() {
+        let store = test_store().await;
+        let err = store
+            .set_default("user-1", "does-not-exist")
+            .await
+            .unwrap_err();
+        assert!(matches!(err, StoreError::NotFound));
+    }
+}

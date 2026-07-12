@@ -1,0 +1,67 @@
+{% extends "base.html" %}
+
+{% block title %}Sigma Payments{% endblock %}
+
+
+{% block main_class %}payments-main{% endblock %}
+
+{% block content %}
+<div class="container py-4">
+  <div class="d-flex flex-wrap justify-content-between align-items-center gap-2 mb-3">
+    <div>
+      <h1 class="mb-1">Payment methods</h1>
+      <p class="text-secondary mb-0">Credit cards and bank accounts on your account.</p>
+    </div>
+    <a class="btn btn-primary btn-sm" href="/new">Add payment method</a>
+  </div>
+
+  {% if let Some(msg) = message %}
+  <div class="alert alert-info" role="status">{{ msg }}</div>
+  {% endif %}
+
+  {% if rows.is_empty() %}
+  <p class="text-secondary">No payment methods yet.</p>
+  {% else %}
+  <div class="table-responsive">
+    <table class="table table-sm align-middle">
+      <thead>
+        <tr>
+          <th>Type</th>
+          <th>Label</th>
+          <th>Brand</th>
+          <th>Last 4</th>
+          <th>Expiry</th>
+          <th>Billing address</th>
+          <th>Default</th>
+          <th></th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for row in rows %}
+        <tr>
+          <td>{{ row.method_type_label }}</td>
+          <td>{% if row.label != "" %}{{ row.label }}{% else %}<span class="text-secondary">—</span>{% endif %}</td>
+          <td>{% if row.brand != "" %}{{ row.brand }}{% else %}<span class="text-secondary">—</span>{% endif %}</td>
+          <td>{{ row.last4_masked }}</td>
+          <td>{% if row.expiry != "" %}{{ row.expiry }}{% else %}<span class="text-secondary">—</span>{% endif %}</td>
+          <td>{{ row.billing_address_summary }}</td>
+          <td>{% if row.is_default %}<span class="badge text-bg-primary">Default</span>{% endif %}</td>
+          <td class="text-nowrap">
+            <a class="btn btn-sm btn-outline-primary" href="{{ row.edit_url }}">Edit</a>
+            {% if !row.is_default %}
+            <form method="post" action="{{ row.default_url }}" class="d-inline">
+              <button type="submit" class="btn btn-sm btn-outline-secondary">Make default</button>
+            </form>
+            {% endif %}
+            <form method="post" action="{{ row.delete_url }}" class="d-inline" onsubmit="return confirm('Delete this payment method?');">
+              <button type="submit" class="btn btn-sm btn-outline-danger">Delete</button>
+            </form>
+          </td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  {% endif %}
+</div>
+{% endblock %}
