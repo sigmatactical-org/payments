@@ -220,7 +220,10 @@ fn validate_fields(
         ));
     }
     if method_type == PaymentMethodType::CreditCard
-        && brand.map(str::trim).filter(|value| !value.is_empty()).is_none()
+        && brand
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .is_none()
     {
         return Err(StoreError::InvalidInput(
             "brand is required for credit cards".to_string(),
