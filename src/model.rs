@@ -114,13 +114,14 @@ impl PaymentMethodForm {
         method_type: PaymentMethodType,
     ) -> Result<CreatePaymentMethod, String> {
         let last4 = validate_last4(&self.last4)?;
+        let brand = validate_brand(method_type, empty_to_none(self.brand))?;
         let (expiry_month, expiry_year) =
             parse_expiry(method_type, &self.expiry_month, &self.expiry_year)?;
         Ok(CreatePaymentMethod {
             method_type,
             billing_address_id: required(self.billing_address_id, "billing_address_id")?,
             label: empty_to_none(self.label),
-            brand: empty_to_none(self.brand),
+            brand,
             last4,
             expiry_month,
             expiry_year,
@@ -132,12 +133,13 @@ impl PaymentMethodForm {
         method_type: PaymentMethodType,
     ) -> Result<UpdatePaymentMethod, String> {
         let last4 = validate_last4(&self.last4)?;
+        let brand = validate_brand(method_type, empty_to_none(self.brand))?;
         let (expiry_month, expiry_year) =
             parse_expiry(method_type, &self.expiry_month, &self.expiry_year)?;
         Ok(UpdatePaymentMethod {
             billing_address_id: required(self.billing_address_id, "billing_address_id")?,
             label: empty_to_none(self.label),
-            brand: empty_to_none(self.brand),
+            brand,
             last4,
             expiry_month,
             expiry_year,
@@ -154,6 +156,20 @@ fn validate_last4(value: &str) -> Result<String, String> {
         Ok(trimmed.to_string())
     } else {
         Err("last4 must be exactly 4 digits".to_string())
+    }
+}
+
+/// Credit cards require a brand/issuer; bank accounts may omit it.
+fn validate_brand(
+    method_type: PaymentMethodType,
+    brand: Option<String>,
+) -> Result<Option<String>, String> {
+    match method_type {
+        PaymentMethodType::CreditCard => brand
+            .filter(|value| !value.trim().is_empty())
+            .map(Some)
+            .ok_or_else(|| "brand is required for credit cards".to_string()),
+        PaymentMethodType::BankAccount => Ok(brand),
     }
 }
 
@@ -331,9 +347,39 @@ mod tests {
     fn form_into_create_credit_card_requires_expiry() {
         let form = PaymentMethodForm {
             billing_address_id: "addr-1".to_string(),
+            brand: "Visa".to_string(),
             last4: "4242".to_string(),
             ..Default::default()
         };
         assert!(form.into_create(PaymentMethodType::CreditCard).is_err());
+    }
+
+    #[test]
+    fn form_into_create_credit_card_requires_brand() {
+        let form = PaymentMethodForm {
+            billing_address_id: "addr-1".to_string(),
+            last4: "4242".to_string(),
+            expiry_month: "12".to_string(),
+            expiry_year: "2099".to_string(),
+            ..Default::default()
+        };
+        let err = form.into_create(PaymentMethodType::CreditCard).unwrap_err();
+        assert!(err.contains("brand"));
+    }
+
+    #[test]
+    fn form_into_create_credit_card_accepts_complete_fields() {
+        let form = PaymentMethodForm {
+            billing_address_id: "addr-1".to_string(),
+            brand: "Visa".to_string(),
+            last4: "4242".to_string(),
+            expiry_month: "12".to_string(),
+            expiry_year: "2099".to_string(),
+            ..Default::default()
+        };
+        let created = form.into_create(PaymentMethodType::CreditCard).unwrap();
+        assert_eq!(created.brand.as_deref(), Some("Visa"));
+        assert_eq!(created.expiry_month, Some(12));
+        assert_eq!(created.expiry_year, Some(2099));
     }
 }

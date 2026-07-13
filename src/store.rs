@@ -91,6 +91,7 @@ impl PaymentMethodStore {
         validate_fields(
             input.method_type,
             &input.billing_address_id,
+            input.brand.as_deref(),
             &input.last4,
             input.expiry_month,
             input.expiry_year,
@@ -128,6 +129,7 @@ impl PaymentMethodStore {
         validate_fields(
             payment_method.method_type,
             &input.billing_address_id,
+            input.brand.as_deref(),
             &input.last4,
             input.expiry_month,
             input.expiry_year,
@@ -202,6 +204,7 @@ impl PaymentMethodStore {
 fn validate_fields(
     method_type: PaymentMethodType,
     billing_address_id: &str,
+    brand: Option<&str>,
     last4: &str,
     expiry_month: Option<u8>,
     expiry_year: Option<u16>,
@@ -214,6 +217,13 @@ fn validate_fields(
     if last4.len() != 4 || !last4.bytes().all(|b| b.is_ascii_digit()) {
         return Err(StoreError::InvalidInput(
             "last4 must be exactly 4 digits".to_string(),
+        ));
+    }
+    if method_type == PaymentMethodType::CreditCard
+        && brand.map(str::trim).filter(|value| !value.is_empty()).is_none()
+    {
+        return Err(StoreError::InvalidInput(
+            "brand is required for credit cards".to_string(),
         ));
     }
     validate_expiry(method_type, expiry_month, expiry_year).map_err(StoreError::InvalidInput)?;
@@ -367,6 +377,15 @@ mod tests {
             .create("user-1", credit_card_input("42"))
             .await
             .unwrap_err();
+        assert!(matches!(err, StoreError::InvalidInput(_)));
+    }
+
+    #[tokio::test]
+    async fn create_rejects_credit_card_missing_brand() {
+        let store = test_store().await;
+        let mut input = credit_card_input("4242");
+        input.brand = None;
+        let err = store.create("user-1", input).await.unwrap_err();
         assert!(matches!(err, StoreError::InvalidInput(_)));
     }
 
