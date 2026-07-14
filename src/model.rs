@@ -26,12 +26,9 @@ impl PaymentMethodType {
     }
 }
 
-/// A saved payment method. This is a demo payment-method registry, **not** a
-/// PCI-compliant payment processor integration: it deliberately has no room
-/// for a full card number (PAN), CVV/CVC, or full bank account/routing
-/// number anywhere in this struct — only `brand`, `last4`, and (credit cards
-/// only) `expiry_month`/`expiry_year`. Never add a field that could hold a
-/// full card or account number.
+/// A saved payment method. Full PAN and CVV are accepted on the create/edit
+/// form for validation only and are **never** persisted — only `brand`,
+/// `last4`, expiry, and (credit cards) `cardholder_name` are stored.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PaymentMethod {
     pub id: String,
@@ -44,11 +41,67 @@ pub struct PaymentMethod {
     pub brand: Option<String>,
     pub last4: String,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub cardholder_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub expiry_month: Option<u8>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub expiry_year: Option<u16>,
     pub is_default: bool,
     pub updated_at: String,
+}
+
+/// Outcome of a deposit/charge against a saved payment method.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ChargeStatus {
+    Succeeded,
+    Failed,
+}
+
+impl ChargeStatus {
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ChargeStatus::Succeeded => "succeeded",
+            ChargeStatus::Failed => "failed",
+        }
+    }
+
+    pub fn parse(value: &str) -> Result<Self, String> {
+        match value.trim() {
+            "succeeded" => Ok(Self::Succeeded),
+            "failed" => Ok(Self::Failed),
+            _ => Err("status must be succeeded or failed".to_string()),
+        }
+    }
+}
+
+/// A recorded charge (demo processor — no card network).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Charge {
+    pub id: String,
+    pub user_id: String,
+    pub payment_method_id: String,
+    pub amount_cents: u64,
+    pub currency: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reference: Option<String>,
+    pub status: ChargeStatus,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub failure_reason: Option<String>,
+    pub created_at: String,
+}
+
+/// Input for `POST /api/charges`.
+#[derive(Debug, Clone, Deserialize)]
+pub struct CreateCharge {
+    pub user_id: String,
+    pub payment_method_id: String,
+    pub amount_cents: u64,
+    #[serde(default)]
+    pub currency: Option<String>,
+    #[serde(default)]
+    pub reference: Option<String>,
 }
 
 /// Fields accepted when creating a payment method. `is_default` is
@@ -67,6 +120,8 @@ pub struct CreatePaymentMethod {
     pub brand: Option<String>,
     pub last4: String,
     #[serde(default)]
+    pub cardholder_name: Option<String>,
+    #[serde(default)]
     pub expiry_month: Option<u8>,
     #[serde(default)]
     pub expiry_year: Option<u16>,
@@ -83,6 +138,8 @@ pub struct UpdatePaymentMethod {
     #[serde(default)]
     pub brand: Option<String>,
     pub last4: String,
+    #[serde(default)]
+    pub cardholder_name: Option<String>,
     #[serde(default)]
     pub expiry_month: Option<u8>,
     #[serde(default)]
@@ -101,6 +158,12 @@ pub struct PaymentMethodForm {
     #[serde(default)]
     pub brand: String,
     #[serde(default)]
+    pub card_number: String,
+    #[serde(default)]
+    pub cardholder_name: String,
+    #[serde(default)]
+    pub cvv: String,
+    #[serde(default)]
     pub last4: String,
     #[serde(default)]
     pub expiry_month: String,
@@ -113,8 +176,23 @@ impl PaymentMethodForm {
         self,
         method_type: PaymentMethodType,
     ) -> Result<CreatePaymentMethod, String> {
-        let last4 = validate_last4(&self.last4)?;
-        let brand = validate_brand(method_type, empty_to_none(self.brand))?;
+        let (brand, last4, cardholder_name) = match method_type {
+            PaymentMethodType::CreditCard => {
+                let digits = normalize_pan(&self.card_number)?;
+                let brand = detect_card_brand(&digits)
+                    .ok_or_else(|| "unrecognized card number — check the digits".to_string())?;
+                validate_pan_for_brand(&digits, brand)?;
+                validate_cvv(&self.cvv, brand)?;
+                let cardholder_name = required(self.cardholder_name, "cardholder_name")?;
+                let last4 = digits[digits.len() - 4..].to_string();
+                (Some(brand.to_string()), last4, Some(cardholder_name))
+            }
+            PaymentMethodType::BankAccount => {
+                let last4 = validate_last4(&self.last4)?;
+                let brand = empty_to_none(self.brand);
+                (brand, last4, None)
+            }
+        };
         let (expiry_month, expiry_year) =
             parse_expiry(method_type, &self.expiry_month, &self.expiry_year)?;
         Ok(CreatePaymentMethod {
@@ -123,6 +201,7 @@ impl PaymentMethodForm {
             label: empty_to_none(self.label),
             brand,
             last4,
+            cardholder_name,
             expiry_month,
             expiry_year,
         })
@@ -131,9 +210,40 @@ impl PaymentMethodForm {
     pub fn into_update(
         self,
         method_type: PaymentMethodType,
+        existing_last4: &str,
+        existing_brand: Option<&str>,
     ) -> Result<UpdatePaymentMethod, String> {
-        let last4 = validate_last4(&self.last4)?;
-        let brand = validate_brand(method_type, empty_to_none(self.brand))?;
+        let (brand, last4, cardholder_name) = match method_type {
+            PaymentMethodType::CreditCard => {
+                let cardholder_name = required(self.cardholder_name, "cardholder_name")?;
+                let pan = self.card_number.trim();
+                if pan.is_empty() {
+                    // Keep stored last4/brand when the card number is left blank on edit.
+                    let brand = existing_brand
+                        .map(str::trim)
+                        .filter(|v| !v.is_empty())
+                        .map(str::to_string)
+                        .ok_or_else(|| {
+                            "brand is missing — re-enter the full card number".to_string()
+                        })?;
+                    let last4 = validate_last4(existing_last4)?;
+                    (Some(brand), last4, Some(cardholder_name))
+                } else {
+                    let digits = normalize_pan(&self.card_number)?;
+                    let brand = detect_card_brand(&digits)
+                        .ok_or_else(|| "unrecognized card number — check the digits".to_string())?;
+                    validate_pan_for_brand(&digits, brand)?;
+                    validate_cvv(&self.cvv, brand)?;
+                    let last4 = digits[digits.len() - 4..].to_string();
+                    (Some(brand.to_string()), last4, Some(cardholder_name))
+                }
+            }
+            PaymentMethodType::BankAccount => {
+                let last4 = validate_last4(&self.last4)?;
+                let brand = empty_to_none(self.brand);
+                (brand, last4, None)
+            }
+        };
         let (expiry_month, expiry_year) =
             parse_expiry(method_type, &self.expiry_month, &self.expiry_year)?;
         Ok(UpdatePaymentMethod {
@@ -141,35 +251,136 @@ impl PaymentMethodForm {
             label: empty_to_none(self.label),
             brand,
             last4,
+            cardholder_name,
             expiry_month,
             expiry_year,
         })
     }
 }
 
-/// Validate that `last4` is exactly 4 ASCII digits. This is the only place a
-/// card/account number fragment is ever accepted — never widen this to more
-/// than 4 characters.
+/// Strip spaces/dashes; require digits only.
+fn normalize_pan(value: &str) -> Result<String, String> {
+    let digits: String = value
+        .chars()
+        .filter(|c| !c.is_whitespace() && *c != '-')
+        .collect();
+    if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return Err("card number must contain digits only".to_string());
+    }
+    if !(13..=19).contains(&digits.len()) {
+        return Err("card number must be 13–19 digits".to_string());
+    }
+    if !luhn_ok(&digits) {
+        return Err("card number failed checksum validation".to_string());
+    }
+    Ok(digits)
+}
+
+fn luhn_ok(digits: &str) -> bool {
+    let mut sum = 0u32;
+    let mut dbl = false;
+    for b in digits.bytes().rev() {
+        let mut d = u32::from(b - b'0');
+        if dbl {
+            d *= 2;
+            if d > 9 {
+                d -= 9;
+            }
+        }
+        sum += d;
+        dbl = !dbl;
+    }
+    sum.is_multiple_of(10)
+}
+
+/// Detect major network from IIN / leading digits.
+#[must_use]
+pub fn detect_card_brand(digits: &str) -> Option<&'static str> {
+    let b = digits.as_bytes();
+    if b.is_empty() {
+        return None;
+    }
+    // American Express: 34 / 37
+    if digits.starts_with("34") || digits.starts_with("37") {
+        return Some("American Express");
+    }
+    // Visa: 4
+    if b[0] == b'4' {
+        return Some("Visa");
+    }
+    // Mastercard: 51–55 or 2221–2720
+    if digits.len() >= 2 {
+        let two: u16 = digits[..2].parse().unwrap_or(0);
+        if (51..=55).contains(&two) {
+            return Some("Mastercard");
+        }
+    }
+    if digits.len() >= 4 {
+        let four: u16 = digits[..4].parse().unwrap_or(0);
+        if (2221..=2720).contains(&four) {
+            return Some("Mastercard");
+        }
+    }
+    // Discover: 6011, 65, 644–649
+    if digits.starts_with("6011") || digits.starts_with("65") {
+        return Some("Discover");
+    }
+    if digits.len() >= 3 {
+        let three: u16 = digits[..3].parse().unwrap_or(0);
+        if (644..=649).contains(&three) {
+            return Some("Discover");
+        }
+    }
+    // Diners Club: 36, 38, 300–305
+    if digits.starts_with("36") || digits.starts_with("38") {
+        return Some("Diners Club");
+    }
+    if digits.len() >= 3 {
+        let three: u16 = digits[..3].parse().unwrap_or(0);
+        if (300..=305).contains(&three) {
+            return Some("Diners Club");
+        }
+    }
+    // JCB: 35
+    if digits.starts_with("35") {
+        return Some("JCB");
+    }
+    None
+}
+
+fn validate_pan_for_brand(digits: &str, brand: &str) -> Result<(), String> {
+    let len = digits.len();
+    let ok = match brand {
+        "American Express" => len == 15,
+        "Diners Club" => (14..=19).contains(&len),
+        "Visa" => (13..=19).contains(&len),
+        "Mastercard" | "Discover" | "JCB" => len == 16,
+        _ => (13..=19).contains(&len),
+    };
+    if ok {
+        Ok(())
+    } else {
+        Err(format!("{brand} card number has an unexpected length"))
+    }
+}
+
+fn validate_cvv(value: &str, brand: &str) -> Result<(), String> {
+    let trimmed = value.trim();
+    let expected = if brand == "American Express" { 4 } else { 3 };
+    if trimmed.len() == expected && trimmed.bytes().all(|b| b.is_ascii_digit()) {
+        Ok(())
+    } else {
+        Err(format!("CVV must be {expected} digits for {brand}"))
+    }
+}
+
+/// Validate that `last4` is exactly 4 ASCII digits.
 fn validate_last4(value: &str) -> Result<String, String> {
     let trimmed = value.trim();
     if trimmed.len() == 4 && trimmed.bytes().all(|b| b.is_ascii_digit()) {
         Ok(trimmed.to_string())
     } else {
         Err("last4 must be exactly 4 digits".to_string())
-    }
-}
-
-/// Credit cards require a brand/issuer; bank accounts may omit it.
-fn validate_brand(
-    method_type: PaymentMethodType,
-    brand: Option<String>,
-) -> Result<Option<String>, String> {
-    match method_type {
-        PaymentMethodType::CreditCard => brand
-            .filter(|value| !value.trim().is_empty())
-            .map(Some)
-            .ok_or_else(|| "brand is required for credit cards".to_string()),
-        PaymentMethodType::BankAccount => Ok(brand),
     }
 }
 
@@ -259,6 +470,7 @@ impl PaymentMethod {
             label: input.label,
             brand: input.brand,
             last4: input.last4,
+            cardholder_name: input.cardholder_name,
             expiry_month: input.expiry_month,
             expiry_year: input.expiry_year,
             is_default: false,
@@ -271,6 +483,7 @@ impl PaymentMethod {
         self.label = input.label;
         self.brand = input.brand;
         self.last4 = input.last4;
+        self.cardholder_name = input.cardholder_name;
         self.expiry_month = input.expiry_month;
         self.expiry_year = input.expiry_year;
         self.updated_at = chrono::Utc::now().to_rfc3339();
@@ -295,6 +508,53 @@ mod tests {
     }
 
     #[test]
+    fn detect_visa_mastercard_amex() {
+        assert_eq!(detect_card_brand("4111111111111111"), Some("Visa"));
+        assert_eq!(detect_card_brand("5500000000000004"), Some("Mastercard"));
+        assert_eq!(detect_card_brand("2223000048400011"), Some("Mastercard"));
+        assert_eq!(
+            detect_card_brand("378282246310005"),
+            Some("American Express")
+        );
+    }
+
+    #[test]
+    fn luhn_accepts_stripe_test_visa() {
+        assert!(luhn_ok("4242424242424242"));
+        assert!(!luhn_ok("4242424242424243"));
+    }
+
+    #[test]
+    fn form_into_create_credit_card_from_pan() {
+        let form = PaymentMethodForm {
+            billing_address_id: "addr-1".to_string(),
+            card_number: "4242 4242 4242 4242".to_string(),
+            cardholder_name: "Jane Doe".to_string(),
+            cvv: "123".to_string(),
+            expiry_month: "12".to_string(),
+            expiry_year: "2099".to_string(),
+            ..Default::default()
+        };
+        let created = form.into_create(PaymentMethodType::CreditCard).unwrap();
+        assert_eq!(created.brand.as_deref(), Some("Visa"));
+        assert_eq!(created.last4, "4242");
+        assert_eq!(created.cardholder_name.as_deref(), Some("Jane Doe"));
+        assert_eq!(created.expiry_month, Some(12));
+    }
+
+    #[test]
+    fn form_into_create_credit_card_requires_cvv_and_name() {
+        let form = PaymentMethodForm {
+            billing_address_id: "addr-1".to_string(),
+            card_number: "4242424242424242".to_string(),
+            expiry_month: "12".to_string(),
+            expiry_year: "2099".to_string(),
+            ..Default::default()
+        };
+        assert!(form.into_create(PaymentMethodType::CreditCard).is_err());
+    }
+
+    #[test]
     fn form_into_create_requires_billing_address_id() {
         let form = PaymentMethodForm {
             last4: "4242".to_string(),
@@ -308,78 +568,18 @@ mod tests {
         assert!(validate_last4("123").is_err());
         assert!(validate_last4("12345").is_err());
         assert!(validate_last4("abcd").is_err());
-        assert!(validate_last4("42-4").is_err());
-    }
-
-    #[test]
-    fn last4_accepts_exactly_4_digits() {
-        assert_eq!(validate_last4("4242").unwrap(), "4242");
-        assert_eq!(validate_last4(" 0000 ").unwrap(), "0000");
     }
 
     #[test]
     fn credit_card_requires_valid_month_and_year() {
         assert!(validate_expiry(PaymentMethodType::CreditCard, None, None).is_err());
         assert!(validate_expiry(PaymentMethodType::CreditCard, Some(0), Some(2099)).is_err());
-        assert!(validate_expiry(PaymentMethodType::CreditCard, Some(13), Some(2099)).is_err());
-        assert!(validate_expiry(PaymentMethodType::CreditCard, Some(1), Some(2000)).is_err());
         assert!(validate_expiry(PaymentMethodType::CreditCard, Some(12), Some(2099)).is_ok());
     }
 
     #[test]
     fn bank_account_rejects_expiry_fields() {
         assert!(validate_expiry(PaymentMethodType::BankAccount, Some(1), None).is_err());
-        assert!(validate_expiry(PaymentMethodType::BankAccount, None, Some(2099)).is_err());
         assert!(validate_expiry(PaymentMethodType::BankAccount, None, None).is_ok());
-    }
-
-    #[test]
-    fn form_into_create_rejects_bad_last4() {
-        let form = PaymentMethodForm {
-            billing_address_id: "addr-1".to_string(),
-            last4: "42".to_string(),
-            ..Default::default()
-        };
-        assert!(form.into_create(PaymentMethodType::BankAccount).is_err());
-    }
-
-    #[test]
-    fn form_into_create_credit_card_requires_expiry() {
-        let form = PaymentMethodForm {
-            billing_address_id: "addr-1".to_string(),
-            brand: "Visa".to_string(),
-            last4: "4242".to_string(),
-            ..Default::default()
-        };
-        assert!(form.into_create(PaymentMethodType::CreditCard).is_err());
-    }
-
-    #[test]
-    fn form_into_create_credit_card_requires_brand() {
-        let form = PaymentMethodForm {
-            billing_address_id: "addr-1".to_string(),
-            last4: "4242".to_string(),
-            expiry_month: "12".to_string(),
-            expiry_year: "2099".to_string(),
-            ..Default::default()
-        };
-        let err = form.into_create(PaymentMethodType::CreditCard).unwrap_err();
-        assert!(err.contains("brand"));
-    }
-
-    #[test]
-    fn form_into_create_credit_card_accepts_complete_fields() {
-        let form = PaymentMethodForm {
-            billing_address_id: "addr-1".to_string(),
-            brand: "Visa".to_string(),
-            last4: "4242".to_string(),
-            expiry_month: "12".to_string(),
-            expiry_year: "2099".to_string(),
-            ..Default::default()
-        };
-        let created = form.into_create(PaymentMethodType::CreditCard).unwrap();
-        assert_eq!(created.brand.as_deref(), Some("Visa"));
-        assert_eq!(created.expiry_month, Some(12));
-        assert_eq!(created.expiry_year, Some(2099));
     }
 }

@@ -7,7 +7,7 @@
 {% block content %}
 <div class="container py-4">
   <h1>{% if is_edit %}Edit payment method{% else %}Add payment method{% endif %}</h1>
-  <p class="text-secondary">This is a demo payment-method registry — never enter a full card number, CVV, or full bank account/routing number here. Only the card/account issuer, the last 4 digits, and (for credit cards) the expiry are stored.</p>
+  <p class="text-secondary">Enter card details as you would at checkout. The full card number and CVV are validated and then discarded — only brand, last 4, expiry, and cardholder name are saved.</p>
 
   {% if let Some(err) = error %}
   <div class="alert alert-danger" role="alert">{{ err }}</div>
@@ -20,7 +20,7 @@
   </div>
   <a class="btn btn-outline-secondary" href="/">Cancel</a>
   {% else %}
-  <form method="post" action="{% if is_edit %}/{{ payment_method_id }}{% else %}/{% endif %}" class="col-lg-8" id="payment-method-form">
+  <form method="post" action="{% if is_edit %}/{{ payment_method_id }}{% else %}/{% endif %}" class="col-lg-8" id="payment-method-form" autocomplete="off" data-is-edit="{% if is_edit %}true{% else %}false{% endif %}">
     <div class="mb-3">
       <label class="form-label" for="method_type">Type</label>
       {% if is_edit %}
@@ -46,58 +46,53 @@
       <label for="label" class="form-label">Label <span class="text-secondary fw-normal">(optional)</span></label>
       <input type="text" class="form-control" id="label" name="label" value="{{ label }}" placeholder="e.g. Personal Visa">
     </div>
-    <div class="mb-3">
-      <label for="brand" class="form-label" id="brand-label">Brand / issuer</label>
-      <input type="text" class="form-control" id="brand" name="brand" value="{{ brand }}" placeholder="e.g. Visa, Mastercard" {% if method_type == "credit_card" %}required{% endif %}>
-    </div>
-    <div class="mb-3">
-      <label for="last4" class="form-label">Last 4 digits</label>
-      <input type="text" class="form-control" id="last4" name="last4" value="{{ last4 }}" maxlength="4" pattern="[0-9]{4}" inputmode="numeric" autocomplete="off" required>
-      <div class="form-text">Only the last 4 digits — never the full card or account number.</div>
-    </div>
-    <div id="cc-expiry-fields" class="row g-2" {% if method_type != "credit_card" %}hidden{% endif %}>
-      <div class="col-md-3 mb-3">
-        <label for="expiry_month" class="form-label">Expiry month</label>
-        <input type="text" class="form-control" id="expiry_month" name="expiry_month" value="{{ expiry_month }}" maxlength="2" pattern="0?[1-9]|1[0-2]" inputmode="numeric" placeholder="MM" autocomplete="off" {% if method_type == "credit_card" %}required{% endif %}>
+
+    <div id="cc-fields" {% if method_type != "credit_card" %}hidden{% endif %}>
+      <div class="mb-3">
+        <label for="cardholder_name" class="form-label">Name on card</label>
+        <input type="text" class="form-control" id="cardholder_name" name="cardholder_name" value="{{ cardholder_name }}" autocomplete="cc-name" {% if method_type == "credit_card" %}required{% endif %}>
       </div>
-      <div class="col-md-3 mb-3">
-        <label for="expiry_year" class="form-label">Expiry year</label>
-        <input type="text" class="form-control" id="expiry_year" name="expiry_year" value="{{ expiry_year }}" maxlength="4" pattern="[0-9]{4}" inputmode="numeric" placeholder="YYYY" autocomplete="off" {% if method_type == "credit_card" %}required{% endif %}>
+      <div class="mb-3">
+        <label for="card_number" class="form-label">Card number</label>
+        <div class="input-group">
+          <input type="text" class="form-control" id="card_number" name="card_number" value="{{ card_number }}" inputmode="numeric" autocomplete="cc-number" maxlength="23" placeholder="•••• •••• •••• ••••" {% if method_type == "credit_card" && !is_edit %}required{% endif %}>
+          <span class="input-group-text" id="detected-brand">{% if brand != "" %}{{ brand }}{% else %}—{% endif %}</span>
+        </div>
+        <div class="form-text" id="card-number-help">{% if is_edit %}Leave blank to keep the saved card ending in {{ last4 }}.{% else %}Brand is detected automatically from the number.{% endif %}</div>
+      </div>
+      <div class="row g-2">
+        <div class="col-md-3 mb-3">
+          <label for="expiry_month" class="form-label">Expiry month</label>
+          <input type="text" class="form-control" id="expiry_month" name="expiry_month" value="{{ expiry_month }}" maxlength="2" pattern="0?[1-9]|1[0-2]" inputmode="numeric" placeholder="MM" autocomplete="cc-exp-month" {% if method_type == "credit_card" %}required{% endif %}>
+        </div>
+        <div class="col-md-3 mb-3">
+          <label for="expiry_year" class="form-label">Expiry year</label>
+          <input type="text" class="form-control" id="expiry_year" name="expiry_year" value="{{ expiry_year }}" maxlength="4" pattern="[0-9]{4}" inputmode="numeric" placeholder="YYYY" autocomplete="cc-exp-year" {% if method_type == "credit_card" %}required{% endif %}>
+        </div>
+        <div class="col-md-3 mb-3">
+          <label for="cvv" class="form-label">CVV</label>
+          <input type="password" class="form-control" id="cvv" name="cvv" value="" maxlength="4" inputmode="numeric" autocomplete="cc-csc" placeholder="•••" {% if method_type == "credit_card" && !is_edit %}required{% endif %}>
+        </div>
       </div>
     </div>
+
+    <div id="bank-fields" {% if method_type == "credit_card" %}hidden{% endif %}>
+      <div class="mb-3">
+        <label for="brand" class="form-label">Bank / issuer <span class="text-secondary fw-normal">(optional)</span></label>
+        <input type="text" class="form-control" id="brand" name="brand" value="{{ brand }}" placeholder="e.g. First Sigma Bank">
+      </div>
+      <div class="mb-3">
+        <label for="last4" class="form-label">Account last 4 digits</label>
+        <input type="text" class="form-control" id="last4" name="last4" value="{{ last4 }}" maxlength="4" pattern="[0-9]{4}" inputmode="numeric" autocomplete="off" {% if method_type == "bank_account" %}required{% endif %}>
+      </div>
+    </div>
+
     <div class="d-flex gap-2">
       <button type="submit" class="btn btn-primary">Save</button>
       <a class="btn btn-outline-secondary" href="/">Cancel</a>
     </div>
   </form>
-  <script>
-  (function () {
-    var typeEl = document.getElementById("method_type");
-    var brand = document.getElementById("brand");
-    var brandLabel = document.getElementById("brand-label");
-    var expiryFields = document.getElementById("cc-expiry-fields");
-    var expiryMonth = document.getElementById("expiry_month");
-    var expiryYear = document.getElementById("expiry_year");
-    if (!typeEl || !brand || !expiryFields) return;
-
-    function sync() {
-      var isCard = typeEl.value === "credit_card";
-      expiryFields.hidden = !isCard;
-      brand.required = isCard;
-      expiryMonth.required = isCard;
-      expiryYear.required = isCard;
-      brandLabel.textContent = isCard ? "Brand / issuer" : "Bank / issuer (optional)";
-      brand.placeholder = isCard ? "e.g. Visa, Mastercard" : "e.g. First Sigma Bank";
-      if (!isCard) {
-        expiryMonth.value = "";
-        expiryYear.value = "";
-      }
-    }
-
-    typeEl.addEventListener("change", sync);
-    sync();
-  })();
-  </script>
+  <script src="/static/js/payment-method-form.js" defer></script>
   {% endif %}
 </div>
 {% endblock %}

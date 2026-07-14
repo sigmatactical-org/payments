@@ -1,5 +1,8 @@
 # sigma-payments
 
+[![License](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](#license)
+[![MSRV](https://img.shields.io/badge/MSRV-1.97.0-blue.svg)](https://www.rust-lang.org)
+
 Payment methods (credit card, bank account) for Sigma Tactical Group identity users. Every payment method is owned by exactly one identity `user_id` and tied to one of that user's billing addresses; there is no admin view and no anonymous access — every route requires an active identity session.
 
 This is a **demo payment-method registry, not a PCI-compliant payment processor integration**. It never accepts, logs, or stores a full card number (PAN), CVV/CVC, or full bank account/routing number — only `brand`, `last4` (exactly 4 digits), and (credit cards only) `expiry_month`/`expiry_year`.

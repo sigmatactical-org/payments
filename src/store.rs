@@ -36,7 +36,7 @@ impl PaymentMethodStore {
     #[cfg(test)]
     pub async fn connect_empty() -> Result<Self, StoreError> {
         let store = Self::connect().await?;
-        sqlx::query("TRUNCATE payments.payment_methods")
+        sqlx::query("TRUNCATE payments.charges, payments.payment_methods CASCADE")
             .execute(&store.pool)
             .await?;
         Ok(store)
@@ -53,7 +53,7 @@ impl PaymentMethodStore {
     pub async fn list_for_user(&self, user_id: &str) -> Result<Vec<PaymentMethod>, StoreError> {
         let rows = sqlx::query(
             "SELECT id, user_id, method_type, billing_address_id, label, brand, last4, \
-             expiry_month, expiry_year, is_default, updated_at \
+             cardholder_name, expiry_month, expiry_year, is_default, updated_at \
              FROM payments.payment_methods WHERE user_id = $1 ORDER BY updated_at DESC",
         )
         .bind(user_id)
@@ -70,7 +70,7 @@ impl PaymentMethodStore {
     pub async fn get_for_user(&self, user_id: &str, id: &str) -> Result<PaymentMethod, StoreError> {
         let row = sqlx::query(
             "SELECT id, user_id, method_type, billing_address_id, label, brand, last4, \
-             expiry_month, expiry_year, is_default, updated_at \
+             cardholder_name, expiry_month, expiry_year, is_default, updated_at \
              FROM payments.payment_methods WHERE id = $1 AND user_id = $2",
         )
         .bind(id)
@@ -93,6 +93,7 @@ impl PaymentMethodStore {
             &input.billing_address_id,
             input.brand.as_deref(),
             &input.last4,
+            input.cardholder_name.as_deref(),
             input.expiry_month,
             input.expiry_year,
         )?;
@@ -100,8 +101,8 @@ impl PaymentMethodStore {
         sqlx::query(
             "INSERT INTO payments.payment_methods \
              (id, user_id, method_type, billing_address_id, label, brand, last4, \
-              expiry_month, expiry_year, is_default, updated_at) \
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)",
+              cardholder_name, expiry_month, expiry_year, is_default, updated_at) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)",
         )
         .bind(&payment_method.id)
         .bind(&payment_method.user_id)
@@ -110,6 +111,7 @@ impl PaymentMethodStore {
         .bind(&payment_method.label)
         .bind(&payment_method.brand)
         .bind(&payment_method.last4)
+        .bind(&payment_method.cardholder_name)
         .bind(payment_method.expiry_month.map(i16::from))
         .bind(payment_method.expiry_year.map(|y| y as i16))
         .bind(payment_method.is_default)
@@ -131,13 +133,15 @@ impl PaymentMethodStore {
             &input.billing_address_id,
             input.brand.as_deref(),
             &input.last4,
+            input.cardholder_name.as_deref(),
             input.expiry_month,
             input.expiry_year,
         )?;
         payment_method.apply_update(input);
         sqlx::query(
             "UPDATE payments.payment_methods SET billing_address_id = $3, label = $4, \
-             brand = $5, last4 = $6, expiry_month = $7, expiry_year = $8, updated_at = $9 \
+             brand = $5, last4 = $6, cardholder_name = $7, expiry_month = $8, expiry_year = $9, \
+             updated_at = $10 \
              WHERE id = $1 AND user_id = $2",
         )
         .bind(&payment_method.id)
@@ -146,6 +150,7 @@ impl PaymentMethodStore {
         .bind(&payment_method.label)
         .bind(&payment_method.brand)
         .bind(&payment_method.last4)
+        .bind(&payment_method.cardholder_name)
         .bind(payment_method.expiry_month.map(i16::from))
         .bind(payment_method.expiry_year.map(|y| y as i16))
         .bind(parse_ts(&payment_method.updated_at)?)
@@ -199,6 +204,70 @@ impl PaymentMethodStore {
         tx.commit().await?;
         Ok(())
     }
+
+    /// Charge `amount_cents` against a saved payment method owned by `user_id`.
+    /// Demo processor: succeeds unless the method's `last4` is `0000`.
+    pub async fn create_charge(
+        &self,
+        user_id: &str,
+        payment_method_id: &str,
+        amount_cents: u64,
+        currency: &str,
+        reference: Option<&str>,
+    ) -> Result<crate::model::Charge, StoreError> {
+        use crate::model::{Charge, ChargeStatus};
+
+        if amount_cents == 0 {
+            return Err(StoreError::InvalidInput(
+                "amount_cents must be greater than zero".to_string(),
+            ));
+        }
+        let currency = currency.trim().to_ascii_lowercase();
+        if currency.is_empty() {
+            return Err(StoreError::InvalidInput("currency is required".to_string()));
+        }
+        let method = self.get_for_user(user_id, payment_method_id).await?;
+        let (status, failure_reason) = if method.last4 == "0000" {
+            (
+                ChargeStatus::Failed,
+                Some("card declined (demo last4 0000)".to_string()),
+            )
+        } else {
+            (ChargeStatus::Succeeded, None)
+        };
+        let charge = Charge {
+            id: uuid::Uuid::new_v4().to_string(),
+            user_id: user_id.trim().to_string(),
+            payment_method_id: payment_method_id.trim().to_string(),
+            amount_cents,
+            currency,
+            reference: reference
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string),
+            status,
+            failure_reason,
+            created_at: chrono::Utc::now().to_rfc3339(),
+        };
+        sqlx::query(
+            "INSERT INTO payments.charges \
+             (id, user_id, payment_method_id, amount_cents, currency, reference, status, \
+              failure_reason, created_at) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)",
+        )
+        .bind(&charge.id)
+        .bind(&charge.user_id)
+        .bind(&charge.payment_method_id)
+        .bind(charge.amount_cents as i64)
+        .bind(&charge.currency)
+        .bind(&charge.reference)
+        .bind(charge.status.as_str())
+        .bind(&charge.failure_reason)
+        .bind(parse_ts(&charge.created_at)?)
+        .execute(&self.pool)
+        .await?;
+        Ok(charge)
+    }
 }
 
 fn validate_fields(
@@ -206,6 +275,7 @@ fn validate_fields(
     billing_address_id: &str,
     brand: Option<&str>,
     last4: &str,
+    cardholder_name: Option<&str>,
     expiry_month: Option<u8>,
     expiry_year: Option<u16>,
 ) -> Result<(), StoreError> {
@@ -219,15 +289,25 @@ fn validate_fields(
             "last4 must be exactly 4 digits".to_string(),
         ));
     }
-    if method_type == PaymentMethodType::CreditCard
-        && brand
+    if method_type == PaymentMethodType::CreditCard {
+        if brand
             .map(str::trim)
             .filter(|value| !value.is_empty())
             .is_none()
-    {
-        return Err(StoreError::InvalidInput(
-            "brand is required for credit cards".to_string(),
-        ));
+        {
+            return Err(StoreError::InvalidInput(
+                "brand is required for credit cards".to_string(),
+            ));
+        }
+        if cardholder_name
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .is_none()
+        {
+            return Err(StoreError::InvalidInput(
+                "cardholder_name is required for credit cards".to_string(),
+            ));
+        }
     }
     validate_expiry(method_type, expiry_month, expiry_year).map_err(StoreError::InvalidInput)?;
     Ok(())
@@ -246,6 +326,7 @@ fn row_to_payment_method(row: sqlx::postgres::PgRow) -> Result<PaymentMethod, St
         label: row.get("label"),
         brand: row.get("brand"),
         last4: row.get("last4"),
+        cardholder_name: row.get("cardholder_name"),
         expiry_month: expiry_month.map(|v| v as u8),
         expiry_year: expiry_year.map(|v| v as u16),
         is_default: row.get("is_default"),
@@ -276,6 +357,7 @@ mod tests {
             label: Some("Personal Visa".to_string()),
             brand: Some("Visa".to_string()),
             last4: last4.to_string(),
+            cardholder_name: Some("Jane Doe".to_string()),
             expiry_month: Some(12),
             expiry_year: Some(2099),
         }
@@ -288,6 +370,7 @@ mod tests {
             label: Some("Checking".to_string()),
             brand: Some("First Sigma Bank".to_string()),
             last4: last4.to_string(),
+            cardholder_name: None,
             expiry_month: None,
             expiry_year: None,
         }
@@ -316,6 +399,7 @@ mod tests {
                     label: Some("Work Visa".to_string()),
                     brand: Some("Visa".to_string()),
                     last4: "1111".to_string(),
+                    cardholder_name: Some("Jane Doe".to_string()),
                     expiry_month: Some(1),
                     expiry_year: Some(2099),
                 },

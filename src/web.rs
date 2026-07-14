@@ -285,7 +285,11 @@ fn update_payment_method(
                     return Ok(resp);
                 }
 
-                let response = match form.into_update(method_type) {
+                let response = match form.into_update(
+                    method_type,
+                    &existing.last4,
+                    existing.brand.as_deref(),
+                ) {
                     Ok(input) => match store.update(&user_id, &id, input).await {
                         Ok(_) => redirect("/"),
                         Err(e) => render_form_error(

@@ -29,6 +29,7 @@
           <th>Type</th>
           <th>Label</th>
           <th>Brand</th>
+          <th>Name</th>
           <th>Last 4</th>
           <th>Expiry</th>
           <th>Billing address</th>
@@ -42,6 +43,7 @@
           <td>{{ row.method_type_label }}</td>
           <td>{% if row.label != "" %}{{ row.label }}{% else %}<span class="text-secondary">—</span>{% endif %}</td>
           <td>{% if row.brand != "" %}{{ row.brand }}{% else %}<span class="text-secondary">—</span>{% endif %}</td>
+          <td>{% if row.cardholder_name != "" %}{{ row.cardholder_name }}{% else %}<span class="text-secondary">—</span>{% endif %}</td>
           <td>{{ row.last4_masked }}</td>
           <td>{% if row.expiry != "" %}{{ row.expiry }}{% else %}<span class="text-secondary">—</span>{% endif %}</td>
           <td>{{ row.billing_address_summary }}</td>

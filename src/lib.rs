@@ -2,6 +2,7 @@
 //! users, each tied to one of the user's billing addresses.
 
 pub mod addresses_client;
+mod api;
 mod model;
 pub mod store;
 mod templates;
@@ -15,7 +16,10 @@ use std::sync::Arc;
 use warp::Filter;
 use warp::Reply;
 
-pub use model::{CreatePaymentMethod, PaymentMethod, PaymentMethodType, UpdatePaymentMethod};
+pub use model::{
+    Charge, ChargeStatus, CreateCharge, CreatePaymentMethod, PaymentMethod, PaymentMethodType,
+    UpdatePaymentMethod,
+};
 
 /// Shared payment method store handle (`PgPool` is internally concurrent).
 pub type SharedStore = Arc<store::PaymentMethodStore>;
@@ -46,9 +50,8 @@ fn content_security_policy() -> String {
     )
 }
 
-/// Site routes: session-gated web UI, `/up`, theme static assets, error
-/// recovery. No internal JSON API is mounted here — unlike addresses (which
-/// payments itself calls), nothing currently calls into payments over HTTP.
+/// Site routes: session-gated web UI, internal JSON API (`/api`), `/up`, theme
+/// static assets, and error recovery.
 pub fn routes(
     store: store::PaymentMethodStore,
 ) -> impl Filter<Extract = (impl Reply,), Error = Infallible> + Clone + Send + 'static {
@@ -64,6 +67,7 @@ pub fn routes(
             "payments",
             Some(health_pool),
         ))
+        .or(warp::path("api").and(api::routes(with_store(store.clone()))))
         .or(web::routes(with_store(store)))
         .or(sigma_theme::warp::static_files())
         .or(sigma_theme::warp::favicon())
