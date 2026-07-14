@@ -7,44 +7,10 @@
 //! services communicating over HTTP+JSON only — this module defines its own
 //! minimal `AddressSummary` rather than depending on the addresses crate.
 
-use serde::Deserialize;
-use thiserror::Error;
-
-#[derive(Debug, Clone, Deserialize)]
-pub struct AddressSummary {
-    pub id: String,
-    #[serde(default)]
-    pub label: Option<String>,
-    pub line1: String,
-    pub city: String,
-    #[serde(default)]
-    pub region: Option<String>,
-    pub postal_code: String,
-    pub country: String,
-    pub category: String,
-}
-
-impl AddressSummary {
-    /// Short one-line summary for the billing-address dropdown, e.g.
-    /// "123 Main St, Springfield".
-    #[must_use]
-    pub fn short_summary(&self) -> String {
-        format!("{}, {}", self.line1, self.city)
-    }
-
-    #[must_use]
-    pub fn is_billing(&self) -> bool {
-        self.category == "billing"
-    }
-}
-
-#[derive(Debug, Error)]
-pub enum AddressesClientError {
-    #[error("HTTP request failed: {0}")]
-    Http(#[from] reqwest::Error),
-    #[error("addresses request failed: {0}")]
-    Request(String),
-}
+mod address_summary;
+mod addresses_client_error;
+pub use address_summary::AddressSummary;
+pub use addresses_client_error::AddressesClientError;
 
 fn build_addresses_url(base: &str, path: &str) -> String {
     format!("{base}{}", path.trim_start_matches('/'))

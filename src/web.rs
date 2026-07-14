@@ -11,6 +11,7 @@ use crate::model::{PaymentMethod, PaymentMethodForm, PaymentMethodType};
 use crate::store::StoreError;
 use crate::templates::{self, PaymentMethodFormValues};
 
+/// Build this module's routes.
 pub fn routes(
     store: impl Filter<Extract = (SharedStore,), Error = Infallible> + Clone + Send + 'static,
 ) -> impl Filter<Extract = (impl Reply,), Error = Rejection> + Clone + Send + 'static {
