@@ -1,6 +1,8 @@
 //! Sigma Payments: payment methods (credit card, bank account) for identity
 //! users, each tied to one of the user's billing addresses.
 
+#![forbid(unsafe_code)]
+
 pub mod addresses_client;
 mod api;
 mod model;
