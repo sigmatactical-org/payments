@@ -23,7 +23,10 @@ fn base_url() -> Result<String, CartError> {
 /// Fetch a cart by id. Returns `Ok(None)` when the cart no longer exists.
 pub async fn get_cart(cart_id: &str) -> Result<Option<CartDetail>, CartError> {
     let url = format!("{}carts/{cart_id}", base_url()?);
-    let response = sigma_pg::clients::http::client().get(url).send().await?;
+    let response =
+        sigma_pg::clients::http::with_internal_auth(sigma_pg::clients::http::client().get(url))
+            .send()
+            .await?;
     if response.status() == reqwest::StatusCode::NOT_FOUND {
         return Ok(None);
     }
