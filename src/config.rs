@@ -73,6 +73,22 @@ pub fn cart_public_base_url() -> String {
         .unwrap_or_else(|| "http://127.0.0.1:8084/".to_string())
 }
 
+/// Base URL of the cart service over the mesh, used server-side to read the
+/// live item count for the navbar badge (e.g. `http://127.0.0.1:8084/`).
+#[must_use]
+pub fn cart_base_url() -> Option<String> {
+    std::env::var("PAYMENTS_CART_BASE_URL")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .map(|s| normalize_base_url(&s))
+}
+
+/// Whether cart integration is configured.
+#[must_use]
+pub fn cart_configured() -> bool {
+    cart_base_url().is_some()
+}
+
 /// Base URL for server-to-server calls to the addresses service's internal
 /// JSON API (validating a submitted `billing_address_id` and listing a
 /// user's billing addresses for the create/edit form dropdown). Must be

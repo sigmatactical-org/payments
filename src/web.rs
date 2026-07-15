@@ -7,6 +7,7 @@ use warp::{Filter, Rejection, Reply};
 
 use crate::SharedStore;
 use crate::addresses_client::{self, AddressSummary};
+use crate::cart_client;
 use crate::model::{PaymentMethod, PaymentMethodForm, PaymentMethodType};
 use crate::store::StoreError;
 use crate::templates::{self, PaymentMethodFormValues};
@@ -101,6 +102,7 @@ fn index(
         .and(cookie_filter())
         .and(store)
         .and_then(|cookie: Option<String>, store: SharedStore| async move {
+            let cart_count = cart_client::nav_cart_count(cookie.as_deref()).await;
             let user_id = match require_user(cookie, "/").await {
                 Ok(user_id) => user_id,
                 Err(resp) => return Ok::<_, Rejection>(resp),
@@ -114,7 +116,7 @@ fn index(
                 .into_iter()
                 .map(|a| (a.id.clone(), a))
                 .collect();
-            templates::render_index_html(payment_methods, &lookup, None)
+            templates::render_index_html(payment_methods, &lookup, None, cart_count)
                 .map(|html| warp::reply::html(html).into_response())
                 .map_err(|_| warp::reject::not_found())
         })
@@ -129,6 +131,7 @@ fn new_payment_method(
         .and(cookie_filter())
         .and(store)
         .and_then(|cookie: Option<String>, _store: SharedStore| async move {
+            let cart_count = cart_client::nav_cart_count(cookie.as_deref()).await;
             let user_id = match require_user(cookie, "/new").await {
                 Ok(user_id) => user_id,
                 Err(resp) => return Ok::<_, Rejection>(resp),
@@ -139,6 +142,7 @@ fn new_payment_method(
                 PaymentMethodType::CreditCard,
                 &billing_addresses,
                 None,
+                cart_count,
             )
             .map(|html| warp::reply::html(html).into_response())
             .map_err(|_| warp::reject::not_found())
@@ -155,6 +159,7 @@ fn create_payment_method(
         .and(store)
         .and_then(
             |cookie: Option<String>, form: PaymentMethodForm, store: SharedStore| async move {
+                let cart_count = cart_client::nav_cart_count(cookie.as_deref()).await;
                 let user_id = match require_user(cookie, "/new").await {
                     Ok(user_id) => user_id,
                     Err(resp) => return Ok::<_, Rejection>(resp),
@@ -173,6 +178,7 @@ fn create_payment_method(
                             &billing_addresses,
                             values,
                             StoreError::InvalidInput(e),
+                            cart_count,
                         ));
                     }
                 };
@@ -184,6 +190,7 @@ fn create_payment_method(
                     method_type,
                     &billing_addresses,
                     &values,
+                    cart_count,
                 )
                 .await
                 {
@@ -193,9 +200,14 @@ fn create_payment_method(
                 let response = match form.into_create(method_type) {
                     Ok(input) => match store.create(&user_id, input).await {
                         Ok(_) => redirect("/"),
-                        Err(e) => {
-                            render_form_error(None, method_type, &billing_addresses, values, e)
-                        }
+                        Err(e) => render_form_error(
+                            None,
+                            method_type,
+                            &billing_addresses,
+                            values,
+                            e,
+                            cart_count,
+                        ),
                     },
                     Err(e) => render_form_error(
                         None,
@@ -203,6 +215,7 @@ fn create_payment_method(
                         &billing_addresses,
                         values,
                         StoreError::InvalidInput(e),
+                        cart_count,
                     ),
                 };
                 Ok(response)
@@ -222,6 +235,7 @@ fn edit_payment_method(
         .and_then(
             |id: String, cookie: Option<String>, store: SharedStore| async move {
                 let return_path = format!("/{id}/edit");
+                let cart_count = cart_client::nav_cart_count(cookie.as_deref()).await;
                 let user_id = match require_user(cookie, &return_path).await {
                     Ok(user_id) => user_id,
                     Err(resp) => return Ok::<_, Rejection>(resp),
@@ -234,6 +248,7 @@ fn edit_payment_method(
                             payment_method.method_type,
                             &billing_addresses,
                             None,
+                            cart_count,
                         )
                         .map(|html| warp::reply::html(html).into_response())
                         .map_err(|_| warp::reject::not_found())
@@ -260,6 +275,7 @@ fn update_payment_method(
              form: PaymentMethodForm,
              store: SharedStore| async move {
                 let return_path = format!("/{id}/edit");
+                let cart_count = cart_client::nav_cart_count(cookie.as_deref()).await;
                 let user_id = match require_user(cookie, &return_path).await {
                     Ok(user_id) => user_id,
                     Err(resp) => return Ok::<_, Rejection>(resp),
@@ -280,6 +296,7 @@ fn update_payment_method(
                     method_type,
                     &billing_addresses,
                     &values,
+                    cart_count,
                 )
                 .await
                 {
@@ -299,6 +316,7 @@ fn update_payment_method(
                             &billing_addresses,
                             values,
                             e,
+                            cart_count,
                         ),
                     },
                     Err(e) => render_form_error(
@@ -307,6 +325,7 @@ fn update_payment_method(
                         &billing_addresses,
                         values,
                         StoreError::InvalidInput(e),
+                        cart_count,
                     ),
                 };
                 Ok(response)
@@ -371,6 +390,7 @@ fn set_default_payment_method(
 /// API. A network failure is treated the same as "not found" (fail closed —
 /// we can't confirm ownership, so we refuse to save) rather than silently
 /// accepting an unverified id.
+#[allow(clippy::too_many_arguments)]
 async fn validate_billing_address(
     user_id: &str,
     billing_address_id: &str,
@@ -378,6 +398,7 @@ async fn validate_billing_address(
     method_type: PaymentMethodType,
     billing_addresses: &[AddressSummary],
     values: &PaymentMethodFormValues,
+    cart_count: u32,
 ) -> Result<(), Response> {
     let found = match addresses_client::get_billing_address(user_id, billing_address_id).await {
         Ok(found) => found,
@@ -397,6 +418,7 @@ async fn validate_billing_address(
         billing_addresses,
         values.clone(),
         StoreError::InvalidInput("Invalid billing address".to_string()),
+        cart_count,
     ))
 }
 
@@ -406,6 +428,7 @@ fn render_form_error(
     billing_addresses: &[AddressSummary],
     values: PaymentMethodFormValues,
     err: StoreError,
+    cart_count: u32,
 ) -> Response {
     let message = err.to_string();
     match templates::render_form_html_with_values(
@@ -414,6 +437,7 @@ fn render_form_error(
         billing_addresses,
         Some(message),
         values,
+        cart_count,
     ) {
         Ok(html) => warp::reply::with_status(warp::reply::html(html), StatusCode::BAD_REQUEST)
             .into_response(),

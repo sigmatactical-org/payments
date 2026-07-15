@@ -22,13 +22,13 @@ fn page_header() -> SiteHeader {
     SiteHeader::new("Payments").with_menu(site_menu(None))
 }
 
-fn site_nav(return_path: &str) -> Result<String, askama::Error> {
+fn site_nav(return_path: &str, cart_count: u32) -> Result<String, askama::Error> {
     render_app_site_nav(&AppSiteNav {
         identity_base: &config::identity_public_base_url(),
         app_base: &config::public_base_url(),
         contact_base: &config::contact_public_base_url(),
         cart_url: &config::cart_public_base_url(),
-        cart_count: 0,
+        cart_count,
         return_path,
         show_cart: true,
         show_contact_us: false,
@@ -85,6 +85,7 @@ pub fn render_index_html(
     payment_methods: Vec<PaymentMethod>,
     billing_addresses: &std::collections::HashMap<String, AddressSummary>,
     message: Option<String>,
+    cart_count: u32,
 ) -> Result<String, askama::Error> {
     let rows = payment_methods
         .iter()
@@ -94,7 +95,7 @@ pub fn render_index_html(
         rows,
         message,
         site_header: page_header(),
-        site_nav: site_nav("/")?,
+        site_nav: site_nav("/", cart_count)?,
         copyright_years: copyright_years(),
     }
     .render()
@@ -121,6 +122,7 @@ fn render_form(
     billing_addresses: &[AddressSummary],
     error: Option<String>,
     values: PaymentMethodFormValues,
+    cart_count: u32,
 ) -> Result<String, askama::Error> {
     let is_edit = payment_method.is_some();
     let payment_method_id = payment_method.map(|pm| pm.id.clone()).unwrap_or_default();
@@ -149,7 +151,7 @@ fn render_form(
         expiry_year: values.expiry_year,
         error,
         site_header: page_header(),
-        site_nav: site_nav(&return_path)?,
+        site_nav: site_nav(&return_path, cart_count)?,
         copyright_years: copyright_years(),
     }
     .render()
@@ -163,6 +165,7 @@ pub fn render_form_html(
     method_type: PaymentMethodType,
     billing_addresses: &[AddressSummary],
     error: Option<String>,
+    cart_count: u32,
 ) -> Result<String, askama::Error> {
     let values = payment_method
         .as_ref()
@@ -174,18 +177,21 @@ pub fn render_form_html(
         billing_addresses,
         error,
         values,
+        cart_count,
     )
 }
 
 /// # Errors
 ///
 /// Returns [`askama::Error`] when template rendering fails.
+#[allow(clippy::too_many_arguments)]
 pub fn render_form_html_with_values(
     payment_method: Option<PaymentMethod>,
     method_type: PaymentMethodType,
     billing_addresses: &[AddressSummary],
     error: Option<String>,
     values: PaymentMethodFormValues,
+    cart_count: u32,
 ) -> Result<String, askama::Error> {
     render_form(
         payment_method.as_ref(),
@@ -193,6 +199,7 @@ pub fn render_form_html_with_values(
         billing_addresses,
         error,
         values,
+        cart_count,
     )
 }
 

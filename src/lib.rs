@@ -5,6 +5,7 @@
 
 pub mod addresses_client;
 mod api;
+pub mod cart_client;
 mod model;
 pub mod store;
 mod templates;
