@@ -15,11 +15,11 @@ use crate::addresses_client::AddressSummary;
 use crate::config;
 use crate::model::{PaymentMethod, PaymentMethodType};
 use sigma_theme::copyright_years;
-use sigma_theme::nav::SiteHeader;
+use sigma_theme::nav::{SiteHeader, site_menu};
 use sigma_theme::site_nav::{AppSiteNav, render_app_site_nav};
 
-fn page_header(brand: &str) -> SiteHeader {
-    SiteHeader::new(brand)
+fn page_header() -> SiteHeader {
+    SiteHeader::new().with_menu(site_menu(None))
 }
 
 fn site_nav(return_path: &str) -> Result<String, askama::Error> {
@@ -93,7 +93,7 @@ pub fn render_index_html(
     IndexTemplate {
         rows,
         message,
-        site_header: page_header("Sigma Payments"),
+        site_header: page_header(),
         site_nav: site_nav("/")?,
         copyright_years: copyright_years(),
     }
@@ -148,7 +148,7 @@ fn render_form(
         expiry_month: values.expiry_month,
         expiry_year: values.expiry_year,
         error,
-        site_header: page_header("Sigma Payments"),
+        site_header: page_header(),
         site_nav: site_nav(&return_path)?,
         copyright_years: copyright_years(),
     }
