@@ -1,7 +1,5 @@
 //! [`ChargeStatus`].
 
-#[allow(unused_imports)]
-use super::*;
 use serde::{Deserialize, Serialize};
 
 /// Outcome of a deposit/charge against a saved payment method.
@@ -20,11 +18,11 @@ impl ChargeStatus {
         }
     }
 
-    /// Parse from its stored/wire string.
+    /// Parse from the stored/wire value.
     pub fn parse(value: &str) -> Result<Self, String> {
-        match value.trim() {
-            "succeeded" => Ok(Self::Succeeded),
-            "failed" => Ok(Self::Failed),
+        match value.trim().to_lowercase().as_str() {
+            "succeeded" => Ok(ChargeStatus::Succeeded),
+            "failed" => Ok(ChargeStatus::Failed),
             _ => Err("status must be succeeded or failed".to_string()),
         }
     }

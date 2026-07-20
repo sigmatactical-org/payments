@@ -1764,6 +1764,7 @@ name = "sigma-contact-nav"
 version = "0.1.0"
 dependencies = [
  "askama",
+ "urlencoding",
 ]
 
 [[package]]
@@ -1771,23 +1772,20 @@ name = "sigma-identity-nav"
 version = "0.1.0"
 dependencies = [
  "askama",
+ "urlencoding",
 ]
 
 [[package]]
 name = "sigma-payments"
 version = "0.1.0"
 dependencies = [
- "anyhow",
  "askama",
  "chrono",
- "reqwest",
  "serde",
- "serde_json",
  "sigma-identity-nav",
  "sigma-pg",
  "sigma-theme",
  "sqlx",
- "thiserror",
  "tokio",
  "tracing",
  "tracing-subscriber",
@@ -1821,6 +1819,7 @@ dependencies = [
  "sigma-cart-nav",
  "sigma-contact-nav",
  "sigma-identity-nav",
+ "tokio",
  "tracing",
  "warp",
 ]
@@ -2400,6 +2399,12 @@ dependencies = [
  "percent-encoding",
  "serde",
 ]
+
+[[package]]
+name = "urlencoding"
+version = "2.1.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "daf8dba3b7eb870caf1ddeed7bc9d2a049f3cfdfae7cb521b087cc33ae4c49da"
 
 [[package]]
 name = "utf8_iter"

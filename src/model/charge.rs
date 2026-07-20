@@ -1,8 +1,9 @@
 //! [`Charge`].
 
-#[allow(unused_imports)]
-use super::*;
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+
+use super::ChargeStatus;
 
 /// A recorded charge (demo processor — no card network).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -17,5 +18,5 @@ pub struct Charge {
     pub status: ChargeStatus,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub failure_reason: Option<String>,
-    pub created_at: String,
+    pub created_at: DateTime<Utc>,
 }

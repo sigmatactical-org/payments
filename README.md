@@ -15,7 +15,7 @@ Shared site chrome comes from [sigma-theme](https://github.com/sigmatactical-org
 ## Public vs internal
 
 - **Session-gated web UI** (`payments.sigma-tactical.com`): every route under `/` requires an identity session cookie. Visitors without one are redirected to identity sign-in and returned here afterward. All reads and writes are scoped to the signed-in user's own `user_id` — there is no cross-user or admin view.
-- **Outbound only**: this service calls the [addresses](https://github.com/sigmatactical-org/addresses) service's internal JSON API (gated by the shared `SIGMA_INTERNAL_TOKEN`) to list a user's billing addresses and to validate that a submitted `billing_address_id` belongs to the caller. Payments does not itself expose an internal API — nothing currently calls into payments over HTTP.
+- **Service-to-service**: this service calls the [addresses](https://github.com/sigmatactical-org/addresses) service's internal JSON API (gated by the shared `SIGMA_INTERNAL_TOKEN`) to list a user's billing addresses and to validate that a submitted `billing_address_id` belongs to the caller. It also exposes its own internal API under `/api` (same token) for the [cart](https://github.com/sigmatactical-org/cart) to charge deposits and for [accounting](https://github.com/sigmatactical-org/accounting) to reconcile receipts.
 
 ## Features
 
@@ -56,7 +56,19 @@ Data lives in the shared PostgreSQL `payments` schema (`payments.payment_methods
 
 ## Admin + JSON API
 
-There is no admin web UI — the web UI at `/` *is* the end-user UI, scoped to whoever is signed in. There is also no internal JSON API exposed by this service (payments is a consumer of addresses' internal API, not a provider of its own).
+There is no admin web UI — the web UI at `/` *is* the end-user UI, scoped to whoever is signed in.
+
+### Internal API
+
+Mounted under `/api` and gated by the shared `SIGMA_INTERNAL_TOKEN`; never reachable from a browser session.
+
+| Method | Path | Description |
+|--------|------|-------------|
+| `GET` | `/api/users/{user_id}/payment-methods` | List a user's saved payment methods (used by cart at checkout) |
+| `POST` | `/api/charges` | Charge a saved payment method; `201` on success, `402` when declined |
+| `GET` | `/api/charges` | The whole charge log, newest first — backs accounting's receipt reconcile |
+
+`GET /api/charges` is deliberately not user-scoped: reconcile needs every successful charge in order to find the ones accounting has no receipt for.
 
 | Method | Path | Description |
 |--------|------|-------------|

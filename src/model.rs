@@ -152,18 +152,20 @@ fn parse_expiry(
     expiry_month: &str,
     expiry_year: &str,
 ) -> Result<(Option<u8>, Option<u16>), String> {
-    let month = empty_to_none(expiry_month.to_string())
-        .map(|s| {
+    let month = match expiry_month.trim() {
+        "" => None,
+        s => Some(
             s.parse::<u8>()
-                .map_err(|_| "expiry_month must be a number".to_string())
-        })
-        .transpose()?;
-    let year = empty_to_none(expiry_year.to_string())
-        .map(|s| {
+                .map_err(|_| "expiry_month must be a number".to_string())?,
+        ),
+    };
+    let year = match expiry_year.trim() {
+        "" => None,
+        s => Some(
             s.parse::<u16>()
-                .map_err(|_| "expiry_year must be a number".to_string())
-        })
-        .transpose()?;
+                .map_err(|_| "expiry_year must be a number".to_string())?,
+        ),
+    };
     validate_expiry(method_type, month, year)?;
     Ok((month, year))
 }
@@ -196,24 +198,6 @@ pub fn validate_expiry(
             }
             Ok(())
         }
-    }
-}
-
-fn empty_to_none(value: String) -> Option<String> {
-    let trimmed = value.trim();
-    if trimmed.is_empty() {
-        None
-    } else {
-        Some(trimmed.to_string())
-    }
-}
-
-fn required(value: String, field: &str) -> Result<String, String> {
-    let trimmed = value.trim();
-    if trimmed.is_empty() {
-        Err(format!("{field} is required"))
-    } else {
-        Ok(trimmed.to_string())
     }
 }
 

@@ -1,7 +1,5 @@
 //! [`CreateCharge`].
 
-#[allow(unused_imports)]
-use super::*;
 use serde::Deserialize;
 
 /// Input for `POST /api/charges`.

@@ -2,60 +2,39 @@
 
 use std::convert::Infallible;
 
+use sigma_pg::api::{internal_auth, json_error, store_error_status};
 use warp::http::StatusCode;
-use warp::reply::Response;
 use warp::{Filter, Rejection, Reply};
 
 use crate::SharedStore;
-use crate::model::CreateCharge;
-use crate::store::StoreError;
-
-#[derive(serde::Serialize)]
-struct ErrorBody {
-    error: String,
-}
-
-fn json_error(status: StatusCode, message: impl Into<String>) -> Response {
-    warp::reply::with_status(
-        warp::reply::json(&ErrorBody {
-            error: message.into(),
-        }),
-        status,
-    )
-    .into_response()
-}
-
-fn store_error_status(err: &StoreError) -> StatusCode {
-    match err {
-        StoreError::NotFound => StatusCode::NOT_FOUND,
-        StoreError::InvalidInput(_) => StatusCode::BAD_REQUEST,
-        StoreError::Database(_) => StatusCode::INTERNAL_SERVER_ERROR,
-    }
-}
-
-fn internal_auth() -> impl Filter<Extract = (), Error = Rejection> + Clone {
-    warp::header::optional::<String>("authorization")
-        .and(warp::header::optional::<String>("x-sigma-internal-token"))
-        .and_then(
-            |authorization: Option<String>, internal_token: Option<String>| async move {
-                if sigma_pg::clients::internal::authorize_internal(
-                    authorization.as_deref(),
-                    internal_token.as_deref(),
-                ) {
-                    Ok::<_, Rejection>(())
-                } else {
-                    Err(warp::reject::not_found())
-                }
-            },
-        )
-        .untuple_one()
-}
+use crate::model::{ChargeStatus, CreateCharge};
 
 /// Mounted under `/api` by [`crate::routes`].
 pub fn routes(
     store: impl Filter<Extract = (SharedStore,), Error = Infallible> + Clone + Send + 'static,
 ) -> impl Filter<Extract = (impl Reply,), Error = Rejection> + Clone + Send + 'static {
-    list_user_payment_methods(store.clone()).or(create_charge(store))
+    list_user_payment_methods(store.clone())
+        .or(list_charges(store.clone()))
+        .or(create_charge(store))
+}
+
+/// `GET /api/charges` — the whole charge log, for the accounting service's
+/// receipt reconcile. Internal-token-gated like every route here, so it is
+/// never reachable from a browser session.
+fn list_charges(
+    store: impl Filter<Extract = (SharedStore,), Error = Infallible> + Clone + Send + 'static,
+) -> impl Filter<Extract = (impl Reply,), Error = Rejection> + Clone + Send + 'static {
+    warp::path("charges")
+        .and(warp::path::end())
+        .and(warp::get())
+        .and(internal_auth())
+        .and(store)
+        .and_then(|store: SharedStore| async move {
+            match store.list_charges().await {
+                Ok(charges) => Ok::<_, Rejection>(warp::reply::json(&charges).into_response()),
+                Err(e) => Ok(json_error(store_error_status(&e), e.to_string())),
+            }
+        })
 }
 
 fn list_user_payment_methods(
@@ -96,7 +75,7 @@ fn create_charge(
                 .await
             {
                 Ok(charge) => {
-                    let status = if charge.status.as_str() == "succeeded" {
+                    let status = if charge.status == ChargeStatus::Succeeded {
                         StatusCode::CREATED
                     } else {
                         StatusCode::PAYMENT_REQUIRED

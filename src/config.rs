@@ -1,10 +1,6 @@
-fn normalize_base_url(url: &str) -> String {
-    let mut url = url.trim().to_string();
-    if !url.ends_with('/') {
-        url.push('/');
-    }
-    url
-}
+//! Environment-driven configuration for the payments service.
+
+use sigma_pg::clients::http::{env_url, normalize_base_url};
 
 /// PostgreSQL connection URL (shared Sigma database).
 #[must_use]
@@ -16,21 +12,13 @@ pub fn database_url() -> String {
 /// (e.g. `http://127.0.0.1:8090/`).
 #[must_use]
 pub fn public_base_url() -> String {
-    std::env::var("PAYMENTS_PUBLIC_BASE_URL")
-        .ok()
-        .filter(|s| !s.trim().is_empty())
-        .map(|s| normalize_base_url(&s))
-        .unwrap_or_else(|| "http://127.0.0.1:8090/".to_string())
+    env_url("PAYMENTS_PUBLIC_BASE_URL", "http://127.0.0.1:8090/")
 }
 
 /// Public base URL of the identity BFF (e.g. `http://127.0.0.1:3000/`).
 #[must_use]
 pub fn identity_public_base_url() -> String {
-    std::env::var("PAYMENTS_IDENTITY_PUBLIC_URL")
-        .ok()
-        .filter(|s| !s.trim().is_empty())
-        .map(|s| normalize_base_url(&s))
-        .unwrap_or_else(|| "http://127.0.0.1:3000/".to_string())
+    env_url("PAYMENTS_IDENTITY_PUBLIC_URL", "http://127.0.0.1:3000/")
 }
 
 /// Browser origin of the identity BFF for CSP `connect-src` (no trailing slash).
@@ -56,37 +44,24 @@ pub fn identity_internal_base_url() -> String {
 /// Public base URL of the contact service for the navbar link.
 #[must_use]
 pub fn contact_public_base_url() -> String {
-    std::env::var("PAYMENTS_CONTACT_PUBLIC_URL")
-        .ok()
-        .filter(|s| !s.trim().is_empty())
-        .map(|s| normalize_base_url(&s))
-        .unwrap_or_else(|| "http://127.0.0.1:8083/".to_string())
+    env_url("PAYMENTS_CONTACT_PUBLIC_URL", "http://127.0.0.1:8083/")
 }
 
 /// Public base URL of the cart service for the navbar link.
 #[must_use]
 pub fn cart_public_base_url() -> String {
-    std::env::var("PAYMENTS_CART_PUBLIC_URL")
-        .ok()
-        .filter(|s| !s.trim().is_empty())
-        .map(|s| normalize_base_url(&s))
-        .unwrap_or_else(|| "http://127.0.0.1:8084/".to_string())
+    env_url("PAYMENTS_CART_PUBLIC_URL", "http://127.0.0.1:8084/")
 }
 
 /// Base URL of the cart service over the mesh, used server-side to read the
 /// live item count for the navbar badge (e.g. `http://127.0.0.1:8084/`).
+/// `None` (unset) means cart integration is not configured.
 #[must_use]
 pub fn cart_base_url() -> Option<String> {
     std::env::var("PAYMENTS_CART_BASE_URL")
         .ok()
         .filter(|s| !s.trim().is_empty())
         .map(|s| normalize_base_url(&s))
-}
-
-/// Whether cart integration is configured.
-#[must_use]
-pub fn cart_configured() -> bool {
-    cart_base_url().is_some()
 }
 
 /// Base URL for server-to-server calls to the addresses service's internal
@@ -97,49 +72,12 @@ pub fn cart_configured() -> bool {
 /// default local port, matching `addresses_public_base_url`'s default.
 #[must_use]
 pub fn addresses_internal_base_url() -> String {
-    std::env::var("PAYMENTS_ADDRESSES_INTERNAL_URL")
-        .ok()
-        .filter(|s| !s.trim().is_empty())
-        .map(|s| normalize_base_url(&s))
-        .unwrap_or_else(|| "http://127.0.0.1:8089/".to_string())
+    env_url("PAYMENTS_ADDRESSES_INTERNAL_URL", "http://127.0.0.1:8089/")
 }
 
 /// Public base URL of the addresses service, for the "add a billing address
 /// first" link shown when a user has none yet.
 #[must_use]
 pub fn addresses_public_base_url() -> String {
-    std::env::var("PAYMENTS_ADDRESSES_PUBLIC_URL")
-        .ok()
-        .filter(|s| !s.trim().is_empty())
-        .map(|s| normalize_base_url(&s))
-        .unwrap_or_else(|| "http://127.0.0.1:8089/".to_string())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn normalize_base_url_adds_trailing_slash() {
-        assert_eq!(
-            normalize_base_url("http://example.com"),
-            "http://example.com/"
-        );
-    }
-
-    #[test]
-    fn normalize_base_url_keeps_existing_trailing_slash() {
-        assert_eq!(
-            normalize_base_url("http://example.com/"),
-            "http://example.com/"
-        );
-    }
-
-    #[test]
-    fn normalize_base_url_trims_whitespace() {
-        assert_eq!(
-            normalize_base_url("  http://example.com  "),
-            "http://example.com/"
-        );
-    }
+    env_url("PAYMENTS_ADDRESSES_PUBLIC_URL", "http://127.0.0.1:8089/")
 }

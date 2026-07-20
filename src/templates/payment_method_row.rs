@@ -1,8 +1,5 @@
 //! [`PaymentMethodRow`].
 
-#[allow(unused_imports)]
-use super::*;
-
 /// A row in the payment method list.
 pub struct PaymentMethodRow {
     pub method_type_label: String,

@@ -1,12 +1,14 @@
-mod store_error;
-pub use store_error::StoreError;
+pub use sigma_pg::api::StoreError;
 
-use chrono::{DateTime, Utc};
 use sqlx::{PgPool, Row};
 
 use crate::model::{
-    CreatePaymentMethod, PaymentMethod, PaymentMethodType, UpdatePaymentMethod, validate_expiry,
+    Charge, ChargeStatus, CreatePaymentMethod, PaymentMethod, PaymentMethodType,
+    UpdatePaymentMethod, validate_expiry,
 };
+
+/// Entity name used in [`StoreError::NotFound`] messages.
+const ENTITY: &str = "payment method";
 
 #[derive(Debug, Clone)]
 pub struct PaymentMethodStore {
@@ -66,7 +68,7 @@ impl PaymentMethodStore {
         .await?;
         match row {
             Some(row) => row_to_payment_method(row),
-            None => Err(StoreError::NotFound),
+            None => Err(StoreError::NotFound(ENTITY)),
         }
     }
 
@@ -102,7 +104,7 @@ impl PaymentMethodStore {
         .bind(payment_method.expiry_month.map(i16::from))
         .bind(payment_method.expiry_year.map(|y| y as i16))
         .bind(payment_method.is_default)
-        .bind(parse_ts(&payment_method.updated_at)?)
+        .bind(payment_method.updated_at)
         .execute(&self.pool)
         .await?;
         Ok(payment_method)
@@ -140,7 +142,7 @@ impl PaymentMethodStore {
         .bind(&payment_method.cardholder_name)
         .bind(payment_method.expiry_month.map(i16::from))
         .bind(payment_method.expiry_year.map(|y| y as i16))
-        .bind(parse_ts(&payment_method.updated_at)?)
+        .bind(payment_method.updated_at)
         .execute(&self.pool)
         .await?;
         Ok(payment_method)
@@ -154,7 +156,7 @@ impl PaymentMethodStore {
                 .execute(&self.pool)
                 .await?;
         if result.rows_affected() == 0 {
-            return Err(StoreError::NotFound);
+            return Err(StoreError::NotFound(ENTITY));
         }
         Ok(())
     }
@@ -186,7 +188,7 @@ impl PaymentMethodStore {
         .await?;
         if result.rows_affected() == 0 {
             tx.rollback().await?;
-            return Err(StoreError::NotFound);
+            return Err(StoreError::NotFound(ENTITY));
         }
         tx.commit().await?;
         Ok(())
@@ -234,7 +236,7 @@ impl PaymentMethodStore {
                 .map(str::to_string),
             status,
             failure_reason,
-            created_at: chrono::Utc::now().to_rfc3339(),
+            created_at: chrono::Utc::now(),
         };
         sqlx::query(
             "INSERT INTO payments.charges \
@@ -250,11 +252,43 @@ impl PaymentMethodStore {
         .bind(&charge.reference)
         .bind(charge.status.as_str())
         .bind(&charge.failure_reason)
-        .bind(parse_ts(&charge.created_at)?)
+        .bind(charge.created_at)
         .execute(&self.pool)
         .await?;
         Ok(charge)
     }
+
+    /// Every recorded charge, newest first.
+    ///
+    /// Unlike payment methods this is deliberately not user-scoped: it backs
+    /// the accounting service's receipt reconcile, which needs the whole
+    /// charge log to find charges that have no receipt yet. The route is
+    /// internal-token-gated and never reachable by a browser session.
+    pub async fn list_charges(&self) -> Result<Vec<Charge>, StoreError> {
+        let rows = sqlx::query(
+            "SELECT id, user_id, payment_method_id, amount_cents, currency, reference, status, \
+             failure_reason, created_at \
+             FROM payments.charges ORDER BY created_at DESC, id",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter().map(row_to_charge).collect()
+    }
+}
+
+fn row_to_charge(row: sqlx::postgres::PgRow) -> Result<Charge, StoreError> {
+    let status_str: String = row.get("status");
+    Ok(Charge {
+        id: row.get("id"),
+        user_id: row.get("user_id"),
+        payment_method_id: row.get("payment_method_id"),
+        amount_cents: row.get::<i64, _>("amount_cents").max(0) as u64,
+        currency: row.get("currency"),
+        reference: row.get("reference"),
+        status: ChargeStatus::parse(&status_str).map_err(StoreError::InvalidInput)?,
+        failure_reason: row.get("failure_reason"),
+        created_at: row.get("created_at"),
+    })
 }
 
 fn validate_fields(
@@ -317,14 +351,8 @@ fn row_to_payment_method(row: sqlx::postgres::PgRow) -> Result<PaymentMethod, St
         expiry_month: expiry_month.map(|v| v as u8),
         expiry_year: expiry_year.map(|v| v as u16),
         is_default: row.get("is_default"),
-        updated_at: row.get::<DateTime<Utc>, _>("updated_at").to_rfc3339(),
+        updated_at: row.get("updated_at"),
     })
-}
-
-fn parse_ts(value: &str) -> Result<DateTime<Utc>, StoreError> {
-    value
-        .parse::<DateTime<Utc>>()
-        .map_err(|e| StoreError::InvalidInput(format!("invalid timestamp: {e}")))
 }
 
 #[cfg(test)]
@@ -361,6 +389,37 @@ mod tests {
             expiry_month: None,
             expiry_year: None,
         }
+    }
+
+    #[tokio::test]
+    async fn list_charges_returns_every_charge_regardless_of_outcome() {
+        let store = test_store().await;
+        let good = store
+            .create("user-1", credit_card_input("4242"))
+            .await
+            .unwrap();
+        // last4 0000 is the demo processor's decline trigger.
+        let declined = store
+            .create("user-2", credit_card_input("0000"))
+            .await
+            .unwrap();
+        let charge = store
+            .create_charge("user-1", &good.id, 5000, "usd", Some("cart-1"))
+            .await
+            .unwrap();
+        store
+            .create_charge("user-2", &declined.id, 900, "usd", Some("cart-2"))
+            .await
+            .unwrap();
+
+        let listed = store.list_charges().await.unwrap();
+        assert_eq!(listed.len(), 2);
+        let recorded = listed.iter().find(|c| c.id == charge.id).unwrap();
+        assert_eq!(recorded.status, ChargeStatus::Succeeded);
+        assert_eq!(recorded.amount_cents, 5000);
+        assert_eq!(recorded.reference.as_deref(), Some("cart-1"));
+        // Reconcile filters on status, so failures must still be listed.
+        assert!(listed.iter().any(|c| c.status == ChargeStatus::Failed));
     }
 
     #[tokio::test]
@@ -402,7 +461,7 @@ mod tests {
             .get_for_user("user-1", &payment_method.id)
             .await
             .unwrap_err();
-        assert!(matches!(err, StoreError::NotFound));
+        assert!(matches!(err, StoreError::NotFound(_)));
     }
 
     #[tokio::test]
@@ -434,14 +493,14 @@ mod tests {
             .get_for_user("user-2", &payment_method.id)
             .await
             .unwrap_err();
-        assert!(matches!(err, StoreError::NotFound));
+        assert!(matches!(err, StoreError::NotFound(_)));
     }
 
     #[tokio::test]
     async fn delete_missing_payment_method_returns_not_found() {
         let store = test_store().await;
         let err = store.delete("user-1", "does-not-exist").await.unwrap_err();
-        assert!(matches!(err, StoreError::NotFound));
+        assert!(matches!(err, StoreError::NotFound(_)));
     }
 
     #[tokio::test]
@@ -544,6 +603,6 @@ mod tests {
             .set_default("user-1", "does-not-exist")
             .await
             .unwrap_err();
-        assert!(matches!(err, StoreError::NotFound));
+        assert!(matches!(err, StoreError::NotFound(_)));
     }
 }

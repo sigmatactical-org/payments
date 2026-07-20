@@ -1,8 +1,9 @@
 //! [`PaymentMethod`].
 
-#[allow(unused_imports)]
-use super::*;
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+
+use super::{CreatePaymentMethod, PaymentMethodType, UpdatePaymentMethod};
 
 /// A saved payment method. Full PAN and CVV are accepted on the create/edit
 /// form for validation only and are **never** persisted — only `brand`,
@@ -25,12 +26,11 @@ pub struct PaymentMethod {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub expiry_year: Option<u16>,
     pub is_default: bool,
-    pub updated_at: String,
+    pub updated_at: DateTime<Utc>,
 }
 impl PaymentMethod {
     #[must_use]
     pub fn new(user_id: &str, input: CreatePaymentMethod) -> Self {
-        let now = chrono::Utc::now().to_rfc3339();
         Self {
             id: uuid::Uuid::new_v4().to_string(),
             user_id: user_id.trim().to_string(),
@@ -43,7 +43,7 @@ impl PaymentMethod {
             expiry_month: input.expiry_month,
             expiry_year: input.expiry_year,
             is_default: false,
-            updated_at: now,
+            updated_at: Utc::now(),
         }
     }
 
@@ -56,6 +56,6 @@ impl PaymentMethod {
         self.cardholder_name = input.cardholder_name;
         self.expiry_month = input.expiry_month;
         self.expiry_year = input.expiry_year;
-        self.updated_at = chrono::Utc::now().to_rfc3339();
+        self.updated_at = Utc::now();
     }
 }

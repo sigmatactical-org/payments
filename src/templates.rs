@@ -11,7 +11,8 @@ pub use payment_method_row::PaymentMethodRow;
 
 use askama::Template;
 
-use crate::addresses_client::AddressSummary;
+use sigma_pg::clients::addresses::AddressSummary;
+
 use crate::config;
 use crate::model::{PaymentMethod, PaymentMethodType};
 use sigma_theme::copyright_years;
@@ -115,7 +116,6 @@ fn billing_address_options(
         .collect()
 }
 
-#[allow(clippy::too_many_arguments)]
 fn render_form(
     payment_method: Option<&PaymentMethod>,
     method_type: PaymentMethodType,
@@ -161,18 +161,17 @@ fn render_form(
 ///
 /// Returns [`askama::Error`] when template rendering fails.
 pub fn render_form_html(
-    payment_method: Option<PaymentMethod>,
+    payment_method: Option<&PaymentMethod>,
     method_type: PaymentMethodType,
     billing_addresses: &[AddressSummary],
     error: Option<String>,
     cart_count: u32,
 ) -> Result<String, askama::Error> {
     let values = payment_method
-        .as_ref()
         .map(PaymentMethodFormValues::from_payment_method)
         .unwrap_or_default();
     render_form(
-        payment_method.as_ref(),
+        payment_method,
         method_type,
         billing_addresses,
         error,
@@ -184,9 +183,8 @@ pub fn render_form_html(
 /// # Errors
 ///
 /// Returns [`askama::Error`] when template rendering fails.
-#[allow(clippy::too_many_arguments)]
 pub fn render_form_html_with_values(
-    payment_method: Option<PaymentMethod>,
+    payment_method: Option<&PaymentMethod>,
     method_type: PaymentMethodType,
     billing_addresses: &[AddressSummary],
     error: Option<String>,
@@ -194,7 +192,7 @@ pub fn render_form_html_with_values(
     cart_count: u32,
 ) -> Result<String, askama::Error> {
     render_form(
-        payment_method.as_ref(),
+        payment_method,
         method_type,
         billing_addresses,
         error,
