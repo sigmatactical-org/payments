@@ -72,6 +72,12 @@ impl PaymentMethodStore {
         }
     }
 
+    /// Insert a new payment method for `user_id`. When it is the user's first
+    /// one it is made the default, so a user always has a default without a
+    /// separate `set_default` step. `NOT EXISTS` is evaluated inside the INSERT
+    /// so the check and the write are one atomic statement; the per-user partial
+    /// unique index still backstops any concurrent double-insert. The persisted
+    /// flag is read back via `RETURNING` so the returned struct matches the row.
     pub async fn create(
         &self,
         user_id: &str,
@@ -86,12 +92,15 @@ impl PaymentMethodStore {
             input.expiry_month,
             input.expiry_year,
         )?;
-        let payment_method = PaymentMethod::new(user_id, input);
-        sqlx::query(
+        let mut payment_method = PaymentMethod::new(user_id, input);
+        let row = sqlx::query(
             "INSERT INTO payments.payment_methods \
              (id, user_id, method_type, billing_address_id, label, brand, last4, \
               cardholder_name, expiry_month, expiry_year, is_default, updated_at) \
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)",
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, \
+              NOT EXISTS (SELECT 1 FROM payments.payment_methods WHERE user_id = $2), \
+              $11) \
+             RETURNING is_default",
         )
         .bind(&payment_method.id)
         .bind(&payment_method.user_id)
@@ -103,10 +112,10 @@ impl PaymentMethodStore {
         .bind(&payment_method.cardholder_name)
         .bind(payment_method.expiry_month.map(i16::from))
         .bind(payment_method.expiry_year.map(|y| y as i16))
-        .bind(payment_method.is_default)
         .bind(payment_method.updated_at)
-        .execute(&self.pool)
+        .fetch_one(&self.pool)
         .await?;
+        payment_method.is_default = row.get("is_default");
         Ok(payment_method)
     }
 
@@ -430,7 +439,8 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(payment_method.user_id, "user-1");
-        assert!(!payment_method.is_default);
+        // The user's first payment method is promoted to default automatically.
+        assert!(payment_method.is_default);
 
         let listed = store.list_for_user("user-1").await.unwrap();
         assert_eq!(listed.len(), 1);
@@ -538,6 +548,29 @@ mod tests {
         input.expiry_month = Some(1);
         let err = store.create("user-1", input).await.unwrap_err();
         assert!(matches!(err, StoreError::InvalidInput(_)));
+    }
+
+    #[tokio::test]
+    async fn first_payment_method_becomes_default() {
+        let store = test_store().await;
+        // The user's first payment method is the default; later ones are not.
+        let first = store
+            .create("user-1", credit_card_input("4242"))
+            .await
+            .unwrap();
+        assert!(first.is_default);
+        let second = store
+            .create("user-1", bank_account_input("5678"))
+            .await
+            .unwrap();
+        assert!(!second.is_default);
+
+        // A different user's first payment method is likewise their own default.
+        let other_user = store
+            .create("user-2", credit_card_input("4242"))
+            .await
+            .unwrap();
+        assert!(other_user.is_default);
     }
 
     #[tokio::test]
