@@ -62,7 +62,10 @@ fn sign_in_redirect(return_path: &str) -> Response {
 
 /// 303 redirect (PRG pattern for form POSTs, also used for the sign-in bounce).
 // `to_string` is required, not redundant: `Uri::from_maybe_shared` needs an
-// owned buffer it can turn into `Bytes` without borrowing past this call.
+// owned buffer (`T: AsRef<[u8]> + 'static`) it can turn into `Bytes` without
+// borrowing past this call. Clippy's `unnecessary_to_owned` misses the
+// `'static` bound here (passing the borrow fails to compile, E0521).
+#[allow(clippy::unnecessary_to_owned)]
 fn redirect(location: &str) -> Response {
     match warp::http::Uri::from_maybe_shared(location.to_string()) {
         Ok(uri) => warp::redirect::see_other(uri).into_response(),
