@@ -51,10 +51,7 @@ mod tests {
     use crate::store;
 
     async fn test_store() -> store::PaymentMethodStore {
-        sigma_pg::clients::internal::ensure_test_internal_token();
-        store::PaymentMethodStore::connect_empty()
-            .await
-            .expect("PostgreSQL required for tests")
+        sigma_pg::test_helpers::ready_store(store::PaymentMethodStore::connect_empty()).await
     }
 
     #[tokio::test]

@@ -32,20 +32,21 @@ pub struct PaymentMethodStore {
 
 impl PaymentMethodStore {
     pub async fn connect() -> Result<Self, StoreError> {
-        let pool = sigma_pg::connect_as("payments").await?;
-        Ok(Self { pool })
+        Ok(Self {
+            pool: sigma_pg::PgStore::connect("payments").await?.into_inner(),
+        })
     }
 
     #[cfg(test)]
     pub async fn connect_empty() -> Result<Self, StoreError> {
-        let store = Self::connect().await?;
-        sigma_pg::assert_disposable_test_db(&store.pool).await;
-        sqlx::query(
-            "TRUNCATE payments.refunds, payments.charges, payments.payment_methods CASCADE",
-        )
-        .execute(&store.pool)
-        .await?;
-        Ok(store)
+        Ok(Self {
+            pool: sigma_pg::PgStore::connect_empty(
+                "payments",
+                "TRUNCATE payments.refunds, payments.charges, payments.payment_methods CASCADE",
+            )
+            .await?
+            .into_inner(),
+        })
     }
 
     #[must_use]

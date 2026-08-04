@@ -12,11 +12,6 @@ Repository: https://github.com/sigmatactical-org/payments
 
 Shared site chrome comes from [sigma-theme](https://github.com/sigmatactical-org/sigma-theme).
 
-## Public vs internal
-
-- **Session-gated web UI** (`payments.sigma-tactical.com`): every route under `/` requires an identity session cookie. Visitors without one are redirected to identity sign-in and returned here afterward. All reads and writes are scoped to the signed-in user's own `user_id` — there is no cross-user or admin view.
-- **Service-to-service**: this service calls the [addresses](https://github.com/sigmatactical-org/addresses) service's internal JSON API (gated by the shared `SIGMA_INTERNAL_TOKEN`) to list a user's billing addresses and to validate that a submitted `billing_address_id` belongs to the caller. It also exposes its own internal API under `/api` (same token) for the [cart](https://github.com/sigmatactical-org/cart) to charge deposits and for [accounting](https://github.com/sigmatactical-org/accounting) to reconcile receipts.
-
 ## Features
 
 - **Credit card and bank account payment methods** — CRUD, one list per identity user
@@ -54,7 +49,12 @@ Each payment method has:
 
 Data lives in the shared PostgreSQL `payments` schema (`payments.payment_methods`), owned by the `payments` role. Schema and role are provisioned by [sigma-pg](https://github.com/sigmatactical-org/sigma-pg)'s migrations, not by this service.
 
-## Admin + JSON API
+## API
+
+### Public vs internal
+
+- **Session-gated web UI** (`payments.sigma-tactical.com`): every route under `/` requires an identity session cookie. Visitors without one are redirected to identity sign-in and returned here afterward. All reads and writes are scoped to the signed-in user's own `user_id` — there is no cross-user or admin view.
+- **Service-to-service**: this service calls the [addresses](https://github.com/sigmatactical-org/addresses) service's internal JSON API (gated by the shared `SIGMA_INTERNAL_TOKEN`) to list a user's billing addresses and to validate that a submitted `billing_address_id` belongs to the caller. It also exposes its own internal API under `/api` (same token) for the [cart](https://github.com/sigmatactical-org/cart) to charge deposits and for [accounting](https://github.com/sigmatactical-org/accounting) to reconcile receipts.
 
 There is no admin web UI — the web UI at `/` *is* the end-user UI, scoped to whoever is signed in.
 
