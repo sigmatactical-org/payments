@@ -7,7 +7,7 @@ use warp::http::StatusCode;
 use warp::{Filter, Rejection, Reply};
 
 use crate::SharedStore;
-use crate::model::{ChargeStatus, CreateCharge};
+use crate::model::{ChargeStatus, CreateCharge, RefundCharge};
 
 /// Mounted under `/api` by [`crate::routes`].
 pub fn routes(
@@ -15,7 +15,36 @@ pub fn routes(
 ) -> impl Filter<Extract = (impl Reply,), Error = Rejection> + Clone + Send + 'static {
     list_user_payment_methods(store.clone())
         .or(list_charges(store.clone()))
-        .or(create_charge(store))
+        .or(create_charge(store.clone()))
+        .or(refund_charge(store))
+}
+
+/// `POST /api/charges/{id}/refund` — reverse a charge in full.
+///
+/// The compensating action for a checkout that took payment but could not be
+/// completed. Idempotent: retrying returns the original refund rather than
+/// issuing a second credit, so a caller that timed out can safely repeat the
+/// request.
+fn refund_charge(
+    store: impl Filter<Extract = (SharedStore,), Error = Infallible> + Clone + Send + 'static,
+) -> impl Filter<Extract = (impl Reply,), Error = Rejection> + Clone + Send + 'static {
+    warp::path!("charges" / String / "refund")
+        .and(warp::path::end())
+        .and(warp::post())
+        .and(internal_auth())
+        .and(warp::body::json())
+        .and(store)
+        .and_then(
+            |charge_id: String, body: RefundCharge, store: SharedStore| async move {
+                match store.refund_charge(&charge_id, &body.reason).await {
+                    Ok(refund) => Ok::<_, Rejection>(
+                        warp::reply::with_status(warp::reply::json(&refund), StatusCode::CREATED)
+                            .into_response(),
+                    ),
+                    Err(e) => Ok(json_error(store_error_status(&e), e.to_string())),
+                }
+            },
+        )
 }
 
 /// `GET /api/charges` — the whole charge log, for the accounting service's

@@ -5,6 +5,8 @@ mod create_payment_method;
 mod payment_method;
 mod payment_method_form;
 mod payment_method_type;
+mod refund;
+mod refund_charge;
 mod update_payment_method;
 pub use charge::Charge;
 pub use charge_status::ChargeStatus;
@@ -13,6 +15,8 @@ pub use create_payment_method::CreatePaymentMethod;
 pub use payment_method::PaymentMethod;
 pub use payment_method_form::PaymentMethodForm;
 pub use payment_method_type::PaymentMethodType;
+pub use refund::Refund;
+pub use refund_charge::RefundCharge;
 pub use update_payment_method::UpdatePaymentMethod;
 
 use chrono::Datelike;

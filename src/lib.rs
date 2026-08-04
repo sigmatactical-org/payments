@@ -11,7 +11,7 @@ mod templates;
 mod web;
 
 use std::convert::Infallible;
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
 
 use warp::Filter;
 use warp::Reply;
@@ -40,16 +40,7 @@ pub fn routes(
         sigma_pg::health::warp::health_routes("payments", Some(health_pool))
             .or(warp::path("api").and(api::routes(with_store(store)))),
     );
-    sigma_theme::warp::security_headers(site, identity_origin())
-}
-
-/// The identity origin appended to the CSP `connect-src`, resolved once.
-/// `security_headers` returns a `'static` filter, so its `connect_src_extra`
-/// must outlive the call; caching here avoids leaking a fresh `String` per
-/// `routes()` invocation.
-fn identity_origin() -> &'static str {
-    static ORIGIN: OnceLock<String> = OnceLock::new();
-    ORIGIN.get_or_init(config::identity_public_origin)
+    sigma_theme::warp::security_headers(site, config::identity_public_origin())
 }
 
 #[cfg(test)]

@@ -10,6 +10,21 @@ use crate::model::{
 /// Entity name used in [`StoreError::NotFound`] messages.
 const ENTITY: &str = "payment method";
 
+/// Entity name used in [`StoreError::NotFound`] messages for charges.
+const CHARGE_ENTITY: &str = "charge";
+
+/// Resolve an idempotent replay against the charge already recorded for a
+/// reference: same amount replays, a different amount is a caller bug.
+fn replayed_charge(existing: Charge, amount_cents: u64) -> Result<Charge, StoreError> {
+    if existing.amount_cents == amount_cents {
+        return Ok(existing);
+    }
+    Err(StoreError::InvalidInput(format!(
+        "reference already charged {} cents; refusing to charge {amount_cents} cents against it",
+        existing.amount_cents
+    )))
+}
+
 #[derive(Debug, Clone)]
 pub struct PaymentMethodStore {
     pool: PgPool,
@@ -25,9 +40,11 @@ impl PaymentMethodStore {
     pub async fn connect_empty() -> Result<Self, StoreError> {
         let store = Self::connect().await?;
         sigma_pg::assert_disposable_test_db(&store.pool).await;
-        sqlx::query("TRUNCATE payments.charges, payments.payment_methods CASCADE")
-            .execute(&store.pool)
-            .await?;
+        sqlx::query(
+            "TRUNCATE payments.refunds, payments.charges, payments.payment_methods CASCADE",
+        )
+        .execute(&store.pool)
+        .await?;
         Ok(store)
     }
 
@@ -205,6 +222,20 @@ impl PaymentMethodStore {
 
     /// Charge `amount_cents` against a saved payment method owned by `user_id`.
     /// Demo processor: succeeds unless the method's `last4` is `0000`.
+    ///
+    /// **Idempotent on `reference`.** Checkout can be retried or
+    /// double-submitted, and there is no transaction spanning the cart and this
+    /// service, so a `reference` that already has a successful charge returns
+    /// that charge rather than taking payment a second time. Checkout passes the
+    /// order id, making the order the unit of idempotency.
+    ///
+    /// A replay for the same reference but a *different* amount is rejected as
+    /// invalid input: the caller has changed the basket under a reference that
+    /// is already paid, and guessing which amount was intended would either
+    /// under-charge or double-charge.
+    ///
+    /// Failed charges are not deduplicated — a declined attempt must not stop
+    /// the customer retrying with another method.
     pub async fn create_charge(
         &self,
         user_id: &str,
@@ -224,6 +255,17 @@ impl PaymentMethodStore {
         if currency.is_empty() {
             return Err(StoreError::InvalidInput("currency is required".to_string()));
         }
+        let reference = reference
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string);
+
+        if let Some(reference) = reference.as_deref()
+            && let Some(existing) = self.succeeded_charge_by_reference(reference).await?
+        {
+            return replayed_charge(existing, amount_cents);
+        }
+
         let method = self.get_for_user(user_id, payment_method_id).await?;
         let (status, failure_reason) = if method.last4 == "0000" {
             (
@@ -239,19 +281,20 @@ impl PaymentMethodStore {
             payment_method_id: payment_method_id.trim().to_string(),
             amount_cents,
             currency,
-            reference: reference
-                .map(str::trim)
-                .filter(|s| !s.is_empty())
-                .map(str::to_string),
+            reference,
             status,
             failure_reason,
             created_at: chrono::Utc::now(),
         };
-        sqlx::query(
+        // `ON CONFLICT DO NOTHING` closes the race the check above cannot: two
+        // concurrent submissions of the same cart can both find no existing
+        // charge, and only one may insert. The loser reads the winner's row.
+        let inserted = sqlx::query(
             "INSERT INTO payments.charges \
              (id, user_id, payment_method_id, amount_cents, currency, reference, status, \
               failure_reason, created_at) \
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)",
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) \
+             ON CONFLICT DO NOTHING",
         )
         .bind(&charge.id)
         .bind(&charge.user_id)
@@ -264,7 +307,144 @@ impl PaymentMethodStore {
         .bind(charge.created_at)
         .execute(&self.pool)
         .await?;
+
+        if inserted.rows_affected() == 0 {
+            let Some(reference) = charge.reference.as_deref() else {
+                return Err(StoreError::Database(anyhow::anyhow!(
+                    "charge insert conflicted without a reference to reconcile against"
+                )));
+            };
+            let winner = self
+                .succeeded_charge_by_reference(reference)
+                .await?
+                .ok_or_else(|| {
+                    StoreError::Database(anyhow::anyhow!(
+                        "charge insert for reference {reference} conflicted but no succeeded \
+                         charge is present"
+                    ))
+                })?;
+            return replayed_charge(winner, amount_cents);
+        }
+
         Ok(charge)
+    }
+
+    /// The successful charge recorded against `reference`, if any.
+    ///
+    /// At most one can exist: `payments_charges_reference_succeeded` enforces
+    /// it (migration 010).
+    pub async fn succeeded_charge_by_reference(
+        &self,
+        reference: &str,
+    ) -> Result<Option<Charge>, StoreError> {
+        let row = sqlx::query(
+            "SELECT id, user_id, payment_method_id, amount_cents, currency, reference, status, \
+             failure_reason, created_at \
+             FROM payments.charges WHERE reference = $1 AND status = 'succeeded'",
+        )
+        .bind(reference)
+        .fetch_optional(&self.pool)
+        .await?;
+        row.map(row_to_charge).transpose()
+    }
+
+    /// Reverse `charge_id` in full, recording `reason`.
+    ///
+    /// **Idempotent.** One refund per charge is enforced by
+    /// `payments_refunds_charge_id`, so a caller that times out and retries
+    /// receives the original refund rather than issuing a second credit. This
+    /// is the compensating action for a checkout that took payment but could
+    /// not be completed.
+    pub async fn refund_charge(
+        &self,
+        charge_id: &str,
+        reason: &str,
+    ) -> Result<crate::model::Refund, StoreError> {
+        use crate::model::Refund;
+
+        let reason = reason.trim();
+        if reason.is_empty() {
+            return Err(StoreError::InvalidInput(
+                "refund reason is required".to_string(),
+            ));
+        }
+        let charge = self.get_charge(charge_id).await?;
+        if charge.status != crate::model::ChargeStatus::Succeeded {
+            return Err(StoreError::InvalidInput(
+                "only a succeeded charge can be refunded".to_string(),
+            ));
+        }
+
+        let refund = Refund {
+            id: uuid::Uuid::new_v4().to_string(),
+            charge_id: charge.id.clone(),
+            amount_cents: charge.amount_cents,
+            reason: reason.to_string(),
+            created_at: chrono::Utc::now(),
+        };
+        let inserted = sqlx::query(
+            "INSERT INTO payments.refunds (id, charge_id, amount_cents, reason, created_at) \
+             VALUES ($1, $2, $3, $4, $5) \
+             ON CONFLICT (charge_id) DO NOTHING",
+        )
+        .bind(&refund.id)
+        .bind(&refund.charge_id)
+        .bind(refund.amount_cents as i64)
+        .bind(&refund.reason)
+        .bind(refund.created_at)
+        .execute(&self.pool)
+        .await?;
+
+        if inserted.rows_affected() == 0 {
+            return self
+                .refund_for_charge(&refund.charge_id)
+                .await?
+                .ok_or_else(|| {
+                    StoreError::Database(anyhow::anyhow!(
+                        "refund insert for charge {} conflicted but no refund is present",
+                        refund.charge_id
+                    ))
+                });
+        }
+        Ok(refund)
+    }
+
+    /// The refund recorded against `charge_id`, if the charge was reversed.
+    pub async fn refund_for_charge(
+        &self,
+        charge_id: &str,
+    ) -> Result<Option<crate::model::Refund>, StoreError> {
+        let row = sqlx::query(
+            "SELECT id, charge_id, amount_cents, reason, created_at \
+             FROM payments.refunds WHERE charge_id = $1",
+        )
+        .bind(charge_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.map(|row| crate::model::Refund {
+            id: row.get("id"),
+            charge_id: row.get("charge_id"),
+            amount_cents: row.get::<i64, _>("amount_cents").max(0) as u64,
+            reason: row.get("reason"),
+            created_at: row.get("created_at"),
+        }))
+    }
+
+    /// Fetch one charge by id.
+    ///
+    /// Not user-scoped: like [`list_charges`](Self::list_charges) this backs
+    /// internal-token-gated routes only.
+    pub async fn get_charge(&self, id: &str) -> Result<Charge, StoreError> {
+        let row = sqlx::query(
+            "SELECT id, user_id, payment_method_id, amount_cents, currency, reference, status, \
+             failure_reason, created_at \
+             FROM payments.charges WHERE id = $1",
+        )
+        .bind(id)
+        .fetch_optional(&self.pool)
+        .await?
+        .ok_or(StoreError::NotFound(CHARGE_ENTITY))?;
+        row_to_charge(row)
     }
 
     /// Every recorded charge, newest first.
@@ -429,6 +609,177 @@ mod tests {
         assert_eq!(recorded.reference.as_deref(), Some("cart-1"));
         // Reconcile filters on status, so failures must still be listed.
         assert!(listed.iter().any(|c| c.status == ChargeStatus::Failed));
+    }
+
+    #[tokio::test]
+    async fn create_charge_replaying_a_reference_returns_the_original_charge() {
+        let store = test_store().await;
+        let method = store
+            .create("user-1", credit_card_input("4242"))
+            .await
+            .unwrap();
+
+        let first = store
+            .create_charge("user-1", &method.id, 5000, "usd", Some("cart-1"))
+            .await
+            .unwrap();
+        // A double-submitted checkout: same cart, same amount.
+        let replay = store
+            .create_charge("user-1", &method.id, 5000, "usd", Some("cart-1"))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            replay.id, first.id,
+            "replay must not create a second charge"
+        );
+        assert_eq!(store.list_charges().await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn create_charge_rejects_a_different_amount_for_a_paid_reference() {
+        let store = test_store().await;
+        let method = store
+            .create("user-1", credit_card_input("4242"))
+            .await
+            .unwrap();
+        store
+            .create_charge("user-1", &method.id, 5000, "usd", Some("cart-1"))
+            .await
+            .unwrap();
+
+        let err = store
+            .create_charge("user-1", &method.id, 7500, "usd", Some("cart-1"))
+            .await
+            .expect_err("a paid reference must not be charged a different amount");
+        assert!(matches!(err, StoreError::InvalidInput(_)), "got {err:?}");
+        assert_eq!(store.list_charges().await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn create_charge_does_not_deduplicate_declines() {
+        let store = test_store().await;
+        // last4 0000 is the demo processor's decline trigger.
+        let declining = store
+            .create("user-1", credit_card_input("0000"))
+            .await
+            .unwrap();
+        let good = store
+            .create("user-1", credit_card_input("4242"))
+            .await
+            .unwrap();
+
+        let first = store
+            .create_charge("user-1", &declining.id, 5000, "usd", Some("cart-1"))
+            .await
+            .unwrap();
+        assert_eq!(first.status, ChargeStatus::Failed);
+
+        // Retrying the same cart with a working method must go through: a
+        // decline is not a completed payment.
+        let retry = store
+            .create_charge("user-1", &good.id, 5000, "usd", Some("cart-1"))
+            .await
+            .unwrap();
+        assert_eq!(retry.status, ChargeStatus::Succeeded);
+        assert_ne!(retry.id, first.id);
+    }
+
+    #[tokio::test]
+    async fn succeeded_charge_by_reference_finds_only_successful_charges() {
+        let store = test_store().await;
+        let declining = store
+            .create("user-1", credit_card_input("0000"))
+            .await
+            .unwrap();
+        store
+            .create_charge("user-1", &declining.id, 5000, "usd", Some("cart-1"))
+            .await
+            .unwrap();
+
+        assert!(
+            store
+                .succeeded_charge_by_reference("cart-1")
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            store
+                .succeeded_charge_by_reference("cart-missing")
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn refund_charge_is_idempotent_and_reverses_the_full_amount() {
+        let store = test_store().await;
+        let method = store
+            .create("user-1", credit_card_input("4242"))
+            .await
+            .unwrap();
+        let charge = store
+            .create_charge("user-1", &method.id, 5000, "usd", Some("cart-1"))
+            .await
+            .unwrap();
+
+        let refund = store
+            .refund_charge(&charge.id, "order creation failed")
+            .await
+            .unwrap();
+        assert_eq!(refund.charge_id, charge.id);
+        assert_eq!(refund.amount_cents, 5000);
+
+        // The cart retries after a timeout; it must not issue a second credit.
+        let replay = store
+            .refund_charge(&charge.id, "order creation failed")
+            .await
+            .unwrap();
+        assert_eq!(replay.id, refund.id);
+
+        let found = store.refund_for_charge(&charge.id).await.unwrap().unwrap();
+        assert_eq!(found.id, refund.id);
+    }
+
+    #[tokio::test]
+    async fn refund_charge_rejects_declines_unknown_charges_and_blank_reasons() {
+        let store = test_store().await;
+        let declining = store
+            .create("user-1", credit_card_input("0000"))
+            .await
+            .unwrap();
+        let declined = store
+            .create_charge("user-1", &declining.id, 5000, "usd", Some("cart-1"))
+            .await
+            .unwrap();
+
+        let err = store
+            .refund_charge(&declined.id, "nothing to reverse")
+            .await
+            .expect_err("a declined charge took no money");
+        assert!(matches!(err, StoreError::InvalidInput(_)), "got {err:?}");
+
+        let err = store
+            .refund_charge("charge-missing", "reason")
+            .await
+            .expect_err("unknown charge");
+        assert!(matches!(err, StoreError::NotFound(_)), "got {err:?}");
+
+        let err = store
+            .refund_charge(&declined.id, "   ")
+            .await
+            .expect_err("a reversal must record why");
+        assert!(matches!(err, StoreError::InvalidInput(_)), "got {err:?}");
+
+        assert!(
+            store
+                .refund_for_charge(&declined.id)
+                .await
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[tokio::test]
