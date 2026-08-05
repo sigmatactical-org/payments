@@ -30,25 +30,49 @@ pub fn routes(
 // Session gate + redirect helpers
 // ---------------------------------------------------------------------------
 
-/// Resolve the signed-in identity user id from the session cookie, or `Err`
+/// Signed-in identity session used to scope payment-method HTML.
+struct SessionUser {
+    user_id: String,
+    is_admin: bool,
+}
+
+/// Resolve the signed-in identity user from the session cookie, or `Err`
 /// with a 303 redirect to identity sign-in (returning to `return_path` after
-/// login). Every route in this service is gated on this — payment methods
-/// are strictly per-user, and there is no anonymous or admin-visible view.
-async fn require_user(cookie: Option<&str>, return_path: &str) -> Result<String, Response> {
+/// login). Admins see every payment method; non-admins see only their own.
+async fn require_user(cookie: Option<&str>, return_path: &str) -> Result<SessionUser, Response> {
     let status = sigma_pg::clients::session::fetch_identity_status(
         &config::identity_internal_base_url(),
         cookie,
     )
     .await;
-    let user_id = match status {
-        Ok(Some(status)) => status.user_id.filter(|id| !id.trim().is_empty()),
+    let session = match status {
+        Ok(Some(status)) => status
+            .user_id
+            .filter(|id| !id.trim().is_empty())
+            .map(|user_id| SessionUser {
+                user_id,
+                is_admin: status.is_admin,
+            }),
         Ok(None) => None,
         Err(error) => {
             tracing::error!("web: fetch_identity_status failed: {error:?}");
             None
         }
     };
-    user_id.ok_or_else(|| sign_in_redirect(return_path))
+    session.ok_or_else(|| sign_in_redirect(return_path))
+}
+
+/// Load one payment method for the session: admins by id, everyone else by owner.
+async fn load_payment_method(
+    store: &SharedStore,
+    session: &SessionUser,
+    id: &str,
+) -> Result<PaymentMethod, StoreError> {
+    if session.is_admin {
+        store.get(id).await
+    } else {
+        store.get_for_user(&session.user_id, id).await
+    }
 }
 
 fn sign_in_redirect(return_path: &str) -> Response {
@@ -132,27 +156,42 @@ fn index(
         .and(cookie_filter())
         .and(store)
         .and_then(|cookie: Option<String>, store: SharedStore| async move {
-            let user_id = match require_user(cookie.as_deref(), "/").await {
-                Ok(user_id) => user_id,
+            let session = match require_user(cookie.as_deref(), "/").await {
+                Ok(session) => session,
                 Err(resp) => return Ok::<_, Rejection>(resp),
             };
-            let (payment_methods, billing_addresses, cart_count) = tokio::join!(
-                store.list_for_user(&user_id),
-                fetch_billing_addresses_or_empty(&user_id),
-                nav_cart_count(cookie.as_deref()),
-            );
-            let payment_methods = match payment_methods {
+            let list = if session.is_admin {
+                store.list().await
+            } else {
+                store.list_for_user(&session.user_id).await
+            };
+            let payment_methods = match list {
                 Ok(payment_methods) => payment_methods,
                 Err(error) => {
-                    tracing::error!("web: list_for_user failed for {user_id}: {error:?}");
+                    tracing::error!(
+                        "web: list payment methods failed for {}: {error:?}",
+                        session.user_id
+                    );
                     return Ok(internal_error());
                 }
             };
-            let lookup: HashMap<String, AddressSummary> = billing_addresses
-                .into_iter()
-                .map(|a| (a.id.clone(), a))
-                .collect();
-            match templates::render_index_html(payment_methods, &lookup, None, cart_count) {
+            let cart_count = nav_cart_count(cookie.as_deref()).await;
+            let lookup = if session.is_admin {
+                billing_address_lookup_for_owners(&payment_methods).await
+            } else {
+                fetch_billing_addresses_or_empty(&session.user_id)
+                    .await
+                    .into_iter()
+                    .map(|a| (a.id.clone(), a))
+                    .collect()
+            };
+            match templates::render_index_html(
+                payment_methods,
+                &lookup,
+                None,
+                cart_count,
+                session.is_admin,
+            ) {
                 Ok(html) => Ok(warp::reply::html(html).into_response()),
                 Err(error) => {
                     tracing::error!("web: index render failed: {error:?}");
@@ -162,6 +201,25 @@ fn index(
         })
 }
 
+/// Billing-address summaries for every distinct owner in `payment_methods`.
+async fn billing_address_lookup_for_owners(
+    payment_methods: &[PaymentMethod],
+) -> HashMap<String, AddressSummary> {
+    let mut owner_ids: Vec<&str> = payment_methods
+        .iter()
+        .map(|pm| pm.user_id.as_str())
+        .collect();
+    owner_ids.sort_unstable();
+    owner_ids.dedup();
+    let mut lookup = HashMap::new();
+    for owner_id in owner_ids {
+        for address in fetch_billing_addresses_or_empty(owner_id).await {
+            lookup.insert(address.id.clone(), address);
+        }
+    }
+    lookup
+}
+
 fn new_payment_method()
 -> impl Filter<Extract = (impl Reply,), Error = Rejection> + Clone + Send + 'static {
     warp::path("new")
@@ -169,12 +227,12 @@ fn new_payment_method()
         .and(warp::get())
         .and(cookie_filter())
         .and_then(|cookie: Option<String>| async move {
-            let user_id = match require_user(cookie.as_deref(), "/new").await {
-                Ok(user_id) => user_id,
+            let session = match require_user(cookie.as_deref(), "/new").await {
+                Ok(session) => session,
                 Err(resp) => return Ok::<_, Rejection>(resp),
             };
             let (billing_addresses, cart_count) = tokio::join!(
-                fetch_billing_addresses_or_empty(&user_id),
+                fetch_billing_addresses_or_empty(&session.user_id),
                 nav_cart_count(cookie.as_deref()),
             );
             match templates::render_form_html(
@@ -203,11 +261,11 @@ fn create_payment_method(
         .and(store)
         .and_then(
             |cookie: Option<String>, form: PaymentMethodForm, store: SharedStore| async move {
-                let user_id = match require_user(cookie.as_deref(), "/new").await {
-                    Ok(user_id) => user_id,
+                let session = match require_user(cookie.as_deref(), "/new").await {
+                    Ok(session) => session,
                     Err(resp) => return Ok::<_, Rejection>(resp),
                 };
-                let billing_addresses = fetch_billing_addresses_or_empty(&user_id).await;
+                let billing_addresses = fetch_billing_addresses_or_empty(&session.user_id).await;
                 let values = PaymentMethodFormValues::from_form(&form);
 
                 let method_type = match PaymentMethodType::parse(&form.method_type) {
@@ -251,7 +309,7 @@ fn create_payment_method(
                         .await);
                     }
                 };
-                let response = match store.create(&user_id, input).await {
+                let response = match store.create(&session.user_id, input).await {
                     Ok(_) => redirect("/"),
                     Err(e) => {
                         render_form_error(
@@ -282,20 +340,23 @@ fn edit_payment_method(
         .and_then(
             |id: String, cookie: Option<String>, store: SharedStore| async move {
                 let return_path = format!("/{id}/edit");
-                let user_id = match require_user(cookie.as_deref(), &return_path).await {
-                    Ok(user_id) => user_id,
+                let session = match require_user(cookie.as_deref(), &return_path).await {
+                    Ok(session) => session,
                     Err(resp) => return Ok::<_, Rejection>(resp),
                 };
-                let payment_method = match store.get_for_user(&user_id, &id).await {
+                let payment_method = match load_payment_method(&store, &session, &id).await {
                     Ok(payment_method) => payment_method,
                     Err(StoreError::NotFound(_)) => return Err(warp::reject::not_found()),
                     Err(error) => {
-                        tracing::error!("web: get_for_user failed for {user_id}/{id}: {error:?}");
+                        tracing::error!(
+                            "web: load payment method failed for {}/{id}: {error:?}",
+                            session.user_id
+                        );
                         return Ok(internal_error());
                     }
                 };
                 let (billing_addresses, cart_count) = tokio::join!(
-                    fetch_billing_addresses_or_empty(&user_id),
+                    fetch_billing_addresses_or_empty(&payment_method.user_id),
                     nav_cart_count(cookie.as_deref()),
                 );
                 match templates::render_form_html(
@@ -330,20 +391,25 @@ fn update_payment_method(
              form: PaymentMethodForm,
              store: SharedStore| async move {
                 let return_path = format!("/{id}/edit");
-                let user_id = match require_user(cookie.as_deref(), &return_path).await {
-                    Ok(user_id) => user_id,
+                let session = match require_user(cookie.as_deref(), &return_path).await {
+                    Ok(session) => session,
                     Err(resp) => return Ok::<_, Rejection>(resp),
                 };
-                let existing: PaymentMethod = match store.get_for_user(&user_id, &id).await {
+                let existing: PaymentMethod = match load_payment_method(&store, &session, &id).await
+                {
                     Ok(payment_method) => payment_method,
                     Err(StoreError::NotFound(_)) => return Err(warp::reject::not_found()),
                     Err(error) => {
-                        tracing::error!("web: get_for_user failed for {user_id}/{id}: {error:?}");
+                        tracing::error!(
+                            "web: load payment method failed for {}/{id}: {error:?}",
+                            session.user_id
+                        );
                         return Ok(internal_error());
                     }
                 };
+                let owner_id = existing.user_id.clone();
                 let method_type = existing.method_type;
-                let billing_addresses = fetch_billing_addresses_or_empty(&user_id).await;
+                let billing_addresses = fetch_billing_addresses_or_empty(&owner_id).await;
                 let values = PaymentMethodFormValues::from_form(&form);
 
                 if !billing_address_is_valid(&billing_addresses, &form.billing_address_id) {
@@ -376,7 +442,7 @@ fn update_payment_method(
                         .await);
                     }
                 };
-                let response = match store.update(&user_id, &id, input).await {
+                let response = match store.update(&owner_id, &id, input).await {
                     Ok(_) => redirect("/"),
                     Err(e) => {
                         render_form_error(
@@ -406,15 +472,29 @@ fn delete_payment_method(
         .and(store)
         .and_then(
             |id: String, cookie: Option<String>, store: SharedStore| async move {
-                let user_id = match require_user(cookie.as_deref(), "/").await {
-                    Ok(user_id) => user_id,
+                let session = match require_user(cookie.as_deref(), "/").await {
+                    Ok(session) => session,
                     Err(resp) => return Ok::<_, Rejection>(resp),
                 };
-                match store.delete(&user_id, &id).await {
+                let payment_method = match load_payment_method(&store, &session, &id).await {
+                    Ok(payment_method) => payment_method,
+                    Err(StoreError::NotFound(_)) => return Err(warp::reject::not_found()),
+                    Err(error) => {
+                        tracing::error!(
+                            "web: load payment method failed for {}/{id}: {error:?}",
+                            session.user_id
+                        );
+                        return Ok(internal_error());
+                    }
+                };
+                match store.delete(&payment_method.user_id, &id).await {
                     Ok(()) => Ok(redirect("/")),
                     Err(StoreError::NotFound(_)) => Err(warp::reject::not_found()),
                     Err(error) => {
-                        tracing::error!("web: delete failed for {user_id}/{id}: {error:?}");
+                        tracing::error!(
+                            "web: delete failed for {}/{id}: {error:?}",
+                            payment_method.user_id
+                        );
                         Ok(internal_error())
                     }
                 }
@@ -433,15 +513,29 @@ fn set_default_payment_method(
         .and(store)
         .and_then(
             |id: String, cookie: Option<String>, store: SharedStore| async move {
-                let user_id = match require_user(cookie.as_deref(), "/").await {
-                    Ok(user_id) => user_id,
+                let session = match require_user(cookie.as_deref(), "/").await {
+                    Ok(session) => session,
                     Err(resp) => return Ok::<_, Rejection>(resp),
                 };
-                match store.set_default(&user_id, &id).await {
+                let payment_method = match load_payment_method(&store, &session, &id).await {
+                    Ok(payment_method) => payment_method,
+                    Err(StoreError::NotFound(_)) => return Err(warp::reject::not_found()),
+                    Err(error) => {
+                        tracing::error!(
+                            "web: load payment method failed for {}/{id}: {error:?}",
+                            session.user_id
+                        );
+                        return Ok(internal_error());
+                    }
+                };
+                match store.set_default(&payment_method.user_id, &id).await {
                     Ok(()) => Ok(redirect("/")),
                     Err(StoreError::NotFound(_)) => Err(warp::reject::not_found()),
                     Err(error) => {
-                        tracing::error!("web: set_default failed for {user_id}/{id}: {error:?}");
+                        tracing::error!(
+                            "web: set_default failed for {}/{id}: {error:?}",
+                            payment_method.user_id
+                        );
                         Ok(internal_error())
                     }
                 }

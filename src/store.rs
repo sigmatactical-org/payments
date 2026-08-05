@@ -54,9 +54,20 @@ impl PaymentMethodStore {
         &self.pool
     }
 
-    /// List every payment method owned by `user_id`. Every read in this
-    /// service is scoped by the caller's verified session `user_id` — there
-    /// is no "list all payment methods" endpoint.
+    /// List every payment method. Used by the admin HTML index; customer
+    /// pages use [`Self::list_for_user`].
+    pub async fn list(&self) -> Result<Vec<PaymentMethod>, StoreError> {
+        let rows = sqlx::query(
+            "SELECT id, user_id, method_type, billing_address_id, label, brand, last4, \
+             cardholder_name, expiry_month, expiry_year, is_default, updated_at \
+             FROM payments.payment_methods ORDER BY user_id, updated_at DESC",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter().map(row_to_payment_method).collect()
+    }
+
+    /// List every payment method owned by `user_id`.
     pub async fn list_for_user(&self, user_id: &str) -> Result<Vec<PaymentMethod>, StoreError> {
         let rows = sqlx::query(
             "SELECT id, user_id, method_type, billing_address_id, label, brand, last4, \
@@ -67,6 +78,23 @@ impl PaymentMethodStore {
         .fetch_all(&self.pool)
         .await?;
         rows.into_iter().map(row_to_payment_method).collect()
+    }
+
+    /// Fetch one payment method by id, unscoped by user. Used by admin HTML
+    /// and the internal JSON API.
+    pub async fn get(&self, id: &str) -> Result<PaymentMethod, StoreError> {
+        let row = sqlx::query(
+            "SELECT id, user_id, method_type, billing_address_id, label, brand, last4, \
+             cardholder_name, expiry_month, expiry_year, is_default, updated_at \
+             FROM payments.payment_methods WHERE id = $1",
+        )
+        .bind(id)
+        .fetch_optional(&self.pool)
+        .await?;
+        match row {
+            Some(row) => row_to_payment_method(row),
+            None => Err(StoreError::NotFound(ENTITY)),
+        }
     }
 
     /// Fetch one payment method, scoped to `user_id`. Returns

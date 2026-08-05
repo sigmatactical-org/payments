@@ -2,6 +2,7 @@
 
 /// A row in the payment method list.
 pub struct PaymentMethodRow {
+    pub user_id: String,
     pub method_type_label: String,
     pub label: String,
     pub brand: String,

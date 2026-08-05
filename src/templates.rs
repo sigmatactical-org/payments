@@ -65,6 +65,7 @@ fn payment_method_row(
         _ => String::new(),
     };
     PaymentMethodRow {
+        user_id: payment_method.user_id.clone(),
         method_type_label: method_type_label(payment_method.method_type).to_string(),
         label: payment_method.label.clone().unwrap_or_default(),
         brand: payment_method.brand.clone().unwrap_or_default(),
@@ -87,6 +88,7 @@ pub fn render_index_html(
     billing_addresses: &std::collections::HashMap<String, AddressSummary>,
     message: Option<String>,
     cart_count: u32,
+    is_admin: bool,
 ) -> Result<String, askama::Error> {
     let rows = payment_methods
         .iter()
@@ -95,6 +97,7 @@ pub fn render_index_html(
     IndexTemplate {
         rows,
         message,
+        is_admin,
         site_header: page_header(),
         site_nav: site_nav("/", cart_count)?,
         copyright_years: copyright_years(),
